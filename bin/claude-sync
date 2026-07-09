@@ -1,31 +1,27 @@
 #!/usr/bin/env bash
-# claude-sync — sync Claude Code config and project memory across devices via git.
+# claude-sync — sync Claude Code config and project memory across devices.
 #
 # Tool and data are decoupled:
 #   • This script is the tool. Install it once per machine.
-#   • Your config lives in a private git repo (a "data repo").
-#     Point CLAUDE_SYNC_DIR at it.
+#   • Your config lives in a private local data directory.
+#     Point CLAUDE_SYNC_DIR at it, then choose a sync backend.
 #
 # https://github.com/lizhizhi7/claude-sync
 
-set -e
+set -euo pipefail
 
-# ---------- script resolution ----------
-
-resolve_script_dir() {
-    local path="$1"
-    while [ -L "$path" ]; do
-        local dir
-        dir="$(cd -P "$(dirname "$path")" && pwd)"
-        path="$(readlink "$path")"
-        [[ "$path" != /* ]] && path="$dir/$path"
-    done
-    cd -P "$(dirname "$path")" && pwd
-}
-
-SCRIPT_DIR="$(resolve_script_dir "${BASH_SOURCE[0]}")"
 CLAUDE_DIR="$HOME/.claude"
 REMOTE="${CLAUDE_SYNC_REMOTE:-origin}"
+BACKEND="${CLAUDE_SYNC_BACKEND:-git}"
+STORAGE_URI="${CLAUDE_SYNC_STORAGE_URI:-}"
+STORAGE_OBJECT="${CLAUDE_SYNC_STORAGE_OBJECT:-claude-sync-data.tar.gz}"
+BACKUP_STAMP="$(date '+%Y%m%d-%H%M%S')"
+BACKUP_DIR="$CLAUDE_DIR/backups/claude-sync-$BACKUP_STAMP"
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
 
 # ---------- arg parsing ----------
 
@@ -35,8 +31,17 @@ WORKDIR_SET=false
 ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -p|--prefix)  PREFIX="$2"; shift 2 ;;
-        -w|--workdir) WORKDIR="$2"; WORKDIR_SET=true; shift 2 ;;
+        -p|--prefix)
+            [ $# -ge 2 ] || die "$1 requires a value"
+            PREFIX="$2"
+            shift 2
+            ;;
+        -w|--workdir)
+            [ $# -ge 2 ] || die "$1 requires a value"
+            WORKDIR="$2"
+            WORKDIR_SET=true
+            shift 2
+            ;;
         -h|--help)    ARGS+=("help"); shift ;;
         *)            ARGS+=("$1"); shift ;;
     esac
@@ -48,13 +53,13 @@ ARG1="${ARGS[1]:-}"
 [ -z "$PREFIX" ] && PREFIX="$(echo "$HOME" | tr '/' '-')"
 [ -n "$WORKDIR" ] && PREFIX="${PREFIX}-$(echo "$WORKDIR" | tr '/' '-')"
 
-# ---------- data repo resolution ----------
+# ---------- data directory resolution ----------
 
 resolve_repo_dir() {
     if [ -z "$CLAUDE_SYNC_DIR" ]; then
         echo "ERROR: CLAUDE_SYNC_DIR is not set." >&2
         echo "" >&2
-        echo "  Point it at your private config repo:" >&2
+        echo "  Point it at your private data directory:" >&2
         echo "    export CLAUDE_SYNC_DIR=\"\$HOME/path/to/your/config\"" >&2
         echo "" >&2
         echo "  Or initialize a new one:" >&2
@@ -65,10 +70,44 @@ resolve_repo_dir() {
         echo "ERROR: CLAUDE_SYNC_DIR=$CLAUDE_SYNC_DIR does not exist." >&2
         exit 1
     fi
-    ( cd "$CLAUDE_SYNC_DIR" && pwd )
+    local dir
+    dir="$(cd "$CLAUDE_SYNC_DIR" && pwd)"
+    if [ "$dir" = "$CLAUDE_DIR" ] || [[ "$dir" == "$CLAUDE_DIR"/* ]]; then
+        echo "ERROR: CLAUDE_SYNC_DIR must not be inside $CLAUDE_DIR." >&2
+        exit 1
+    fi
+    if [ ! -e "$dir/.claude-sync-data" ]; then
+        echo "ERROR: $dir is not marked as a claude-sync data directory." >&2
+        echo "  Run: claude-sync init \"$dir\"" >&2
+        echo "  Or, if you know this directory is safe: touch \"$dir/.claude-sync-data\"" >&2
+        exit 1
+    fi
+    printf '%s\n' "$dir"
 }
 
 # ---------- helpers ----------
+
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+is_repo_target() {
+    local dest="$1"
+    case "$dest" in
+        "$REPO_DIR"|"$REPO_DIR"/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+backup_path() {
+    local path="$1" rel dest
+    [ -e "$path" ] || [ -L "$path" ] || return 0
+    rel="${path#"$CLAUDE_DIR"/}"
+    dest="$BACKUP_DIR/$rel"
+    mkdir -p "$(dirname "$dest")"
+    mv "$path" "$dest"
+    echo "  backed up existing $rel -> $dest"
+}
 
 make_link() {
     local target="$1" link_path="$2"
@@ -76,8 +115,18 @@ make_link() {
     link_dir="$(dirname "$link_path")"
     link_name="$(basename "$link_path")"
     mkdir -p "$link_dir"
-    rm -rf "$link_path"
+    if [ -L "$link_path" ]; then
+        rm -f "$link_path"
+    elif [ -e "$link_path" ]; then
+        backup_path "$link_path"
+    fi
     ( cd "$link_dir" && ln -s -- "$target" "$link_name" )
+}
+
+copy_tree_no_clobber() {
+    local src="$1" dst="$2"
+    mkdir -p "$dst"
+    cp -pRn "$src/." "$dst/" 2>/dev/null || true
 }
 
 git_branch() {
@@ -105,6 +154,166 @@ git_pull_rebase() {
     fi
 }
 
+storage_object_uri() {
+    [ -n "$STORAGE_URI" ] || die "CLAUDE_SYNC_STORAGE_URI is required for backend '$BACKEND'."
+    printf '%s/%s\n' "${STORAGE_URI%/}" "$STORAGE_OBJECT"
+}
+
+create_storage_archive() {
+    local archive="$1" stage path
+    stage="$(mktemp -d)"
+    for path in .gitignore .claude-sync-data README.md settings.json CLAUDE.md keybindings.json skills mcp-servers projects; do
+        [ -e "$REPO_DIR/$path" ] || continue
+        cp -pR "$REPO_DIR/$path" "$stage/$path"
+    done
+    if [ -d "$stage/mcp-servers" ]; then
+        find "$stage/mcp-servers" -path '*/.venv' -type d -prune -exec rm -rf {} +
+    fi
+    if [ -d "$stage/projects" ]; then
+        find "$stage/projects" -name '*.jsonl' -type f -delete
+    fi
+    tar -czf "$archive" -C "$stage" .
+    rm -rf "$stage"
+}
+
+validate_storage_archive() {
+    local archive="$1" path
+    while IFS= read -r path; do
+        case "$path" in
+            /*|../*|*/../*|*/..)
+                die "refusing to extract unsafe archive path: $path"
+                ;;
+        esac
+    done < <(tar -tzf "$archive")
+}
+
+extract_storage_archive() {
+    local archive="$1" extract_dir="$2" first_link
+    mkdir -p "$extract_dir"
+    validate_storage_archive "$archive"
+    tar -xzf "$archive" -C "$extract_dir"
+    first_link="$(find "$extract_dir" -type l -print -quit)"
+    [ -z "$first_link" ] || die "refusing to extract archive containing symlink: $first_link"
+}
+
+clear_synced_data_paths() {
+    local path
+    for path in \
+        "$REPO_DIR/settings.json" \
+        "$REPO_DIR/keybindings.json" \
+        "$REPO_DIR/CLAUDE.md" \
+        "$REPO_DIR/skills" \
+        "$REPO_DIR/mcp-servers" \
+        "$REPO_DIR/projects"; do
+        [ -e "$path" ] || [ -L "$path" ] || continue
+        rm -rf "$path"
+    done
+}
+
+backend_require() {
+    case "$BACKEND" in
+        git)
+            command_exists git || die "git is required for backend 'git'."
+            require_remote
+            ;;
+        s3)
+            command_exists aws || die "AWS CLI is required for backend 's3'."
+            case "$(storage_object_uri)" in
+                s3://*) : ;;
+                *) die "CLAUDE_SYNC_STORAGE_URI must start with s3:// for backend 's3'." ;;
+            esac
+            ;;
+        gcs)
+            command_exists gcloud || die "gcloud CLI is required for backend 'gcs'."
+            case "$(storage_object_uri)" in
+                gs://*) : ;;
+                *) die "CLAUDE_SYNC_STORAGE_URI must start with gs:// for backend 'gcs'." ;;
+            esac
+            ;;
+        local)
+            ;;
+        *)
+            die "unknown CLAUDE_SYNC_BACKEND '$BACKEND' (expected git, s3, gcs, or local)."
+            ;;
+    esac
+}
+
+backend_pull() {
+    local uri tmp
+    case "$BACKEND" in
+        git)
+            git_pull_rebase
+            ;;
+        s3)
+            uri="$(storage_object_uri)"
+            tmp="$(mktemp -d)"
+            if aws s3 ls "$uri" >/dev/null 2>&1; then
+                aws s3 cp "$uri" "$tmp/data.tar.gz"
+                extract_storage_archive "$tmp/data.tar.gz" "$tmp/extract"
+                clear_synced_data_paths
+                cp -pR "$tmp/extract/." "$REPO_DIR/"
+                echo "Pulled archive from $uri."
+            else
+                echo "No remote archive found at $uri."
+            fi
+            rm -rf "$tmp"
+            ;;
+        gcs)
+            uri="$(storage_object_uri)"
+            tmp="$(mktemp -d)"
+            if gcloud storage ls "$uri" >/dev/null 2>&1; then
+                gcloud storage cp "$uri" "$tmp/data.tar.gz"
+                extract_storage_archive "$tmp/data.tar.gz" "$tmp/extract"
+                clear_synced_data_paths
+                cp -pR "$tmp/extract/." "$REPO_DIR/"
+                echo "Pulled archive from $uri."
+            else
+                echo "No remote archive found at $uri."
+            fi
+            rm -rf "$tmp"
+            ;;
+        local)
+            echo "Local backend: nothing to pull."
+            ;;
+    esac
+}
+
+backend_push() {
+    local uri tmp
+    case "$BACKEND" in
+        git)
+            git push "$REMOTE" "$(git_branch)"
+            ;;
+        s3)
+            uri="$(storage_object_uri)"
+            tmp="$(mktemp -d)"
+            create_storage_archive "$tmp/data.tar.gz"
+            aws s3 cp "$tmp/data.tar.gz" "$uri"
+            rm -rf "$tmp"
+            echo "Pushed archive to $uri."
+            ;;
+        gcs)
+            uri="$(storage_object_uri)"
+            tmp="$(mktemp -d)"
+            create_storage_archive "$tmp/data.tar.gz"
+            gcloud storage cp "$tmp/data.tar.gz" "$uri"
+            rm -rf "$tmp"
+            echo "Pushed archive to $uri."
+            ;;
+        local)
+            echo "Local backend: nothing to push."
+            ;;
+    esac
+}
+
+git_commit_if_needed() {
+    git add -A
+    if git diff --cached --quiet; then
+        return 1
+    fi
+    git commit -m "sync: $(hostname) $(date '+%Y-%m-%d %H:%M')"
+}
+
 # ---------- linking ----------
 
 link_configs() {
@@ -130,7 +339,11 @@ link_configs() {
             if [ -d "$target/.venv" ]; then
                 venv_backup="$(mktemp -d)"
                 mv "$target/.venv" "$venv_backup/.venv"
-                rm -rf "$target"
+                if [ -L "$target" ]; then
+                    rm -f "$target"
+                elif [ -e "$target" ]; then
+                    backup_path "$target"
+                fi
                 mkdir -p "$target"
                 for inner in "$srv_dir"*; do
                     [ ! -e "$inner" ] && continue
@@ -139,7 +352,11 @@ link_configs() {
                 mv "$venv_backup/.venv" "$target/.venv"
                 rm -rf "$venv_backup"
             else
-                rm -rf "$target"
+                if [ -L "$target" ]; then
+                    rm -f "$target"
+                elif [ -e "$target" ]; then
+                    backup_path "$target"
+                fi
                 mkdir -p "$target"
                 for inner in "$srv_dir"*; do
                     [ ! -e "$inner" ] && continue
@@ -159,8 +376,6 @@ link_projects() {
         canonical="$(basename "$(dirname "$canonical_mem")")"
 
         mkdir -p "$CLAUDE_DIR/projects/$canonical"
-        [ ! -L "$CLAUDE_DIR/projects/$canonical/memory" ] \
-            && rm -rf "$CLAUDE_DIR/projects/$canonical/memory"
         make_link "$canonical_mem" "$CLAUDE_DIR/projects/$canonical/memory"
 
         if [ "$canonical" = "_home" ]; then
@@ -169,8 +384,6 @@ link_projects() {
             device_name="${PREFIX}${canonical}"
         fi
         mkdir -p "$CLAUDE_DIR/projects/$device_name"
-        [ ! -L "$CLAUDE_DIR/projects/$device_name/memory" ] \
-            && rm -rf "$CLAUDE_DIR/projects/$device_name/memory"
         make_link "$canonical_mem" "$CLAUDE_DIR/projects/$device_name/memory"
 
         count=$((count + 1))
@@ -188,13 +401,13 @@ migrate_local_memory() {
         device_dir="$(basename "$(dirname "$device_mem")")"
         canonical="${device_dir#"$PREFIX"}"
         mkdir -p "$REPO_DIR/projects/$canonical/memory"
-        cp -Rn "$device_mem/"* "$REPO_DIR/projects/$canonical/memory/" 2>/dev/null || true
+        copy_tree_no_clobber "$device_mem" "$REPO_DIR/projects/$canonical/memory"
         count=$((count + 1))
     done
     if [ -d "$CLAUDE_DIR/projects/$PREFIX/memory" ] \
        && [ ! -L "$CLAUDE_DIR/projects/$PREFIX/memory" ]; then
         mkdir -p "$REPO_DIR/projects/_home/memory"
-        cp -Rn "$CLAUDE_DIR/projects/$PREFIX/memory/"* "$REPO_DIR/projects/_home/memory/" 2>/dev/null || true
+        copy_tree_no_clobber "$CLAUDE_DIR/projects/$PREFIX/memory" "$REPO_DIR/projects/_home/memory"
         count=$((count + 1))
     fi
     [ "$count" -gt 0 ] && echo "  migrated memory from $count local project(s)"
@@ -233,9 +446,11 @@ do_unlink() {
         target="$CLAUDE_DIR/$f"
         if [ -L "$target" ]; then
             dest="$(readlink "$target")"
-            case "$dest" in
-                "$REPO_DIR"*) rm -f "$target"; echo "  unlinked $f"; removed=$((removed+1)) ;;
-            esac
+            if is_repo_target "$dest"; then
+                rm -f "$target"
+                echo "  unlinked $f"
+                removed=$((removed+1))
+            fi
         fi
     done
     if [ -d "$CLAUDE_DIR/mcp-servers" ]; then
@@ -247,9 +462,10 @@ do_unlink() {
                 [ ! -e "$inner" ] && [ ! -L "$inner" ] && continue
                 if [ -L "$inner" ]; then
                     dest="$(readlink "$inner")"
-                    case "$dest" in
-                        "$REPO_DIR"*) rm -f "$inner"; touched=true ;;
-                    esac
+                    if is_repo_target "$dest"; then
+                        rm -f "$inner"
+                        touched=true
+                    fi
                 fi
             done
             if [ -z "$(ls -A "$srv_dir" 2>/dev/null)" ]; then
@@ -266,19 +482,17 @@ do_unlink() {
         for mem_link in "$CLAUDE_DIR"/projects/*/memory; do
             [ ! -L "$mem_link" ] && continue
             dest="$(readlink "$mem_link")"
-            case "$dest" in
-                "$REPO_DIR"*)
-                    rm -f "$mem_link"
-                    rmdir "$(dirname "$mem_link")" 2>/dev/null || true
-                    removed=$((removed+1))
-                    ;;
-            esac
+            if is_repo_target "$dest"; then
+                rm -f "$mem_link"
+                rmdir "$(dirname "$mem_link")" 2>/dev/null || true
+                removed=$((removed+1))
+            fi
         done
     fi
     if [ "$removed" -eq 0 ]; then
         echo "  nothing to unlink."
     else
-        echo "Unlinked $removed item(s). Repo at $REPO_DIR is intact."
+        echo "Unlinked $removed item(s). Data directory at $REPO_DIR is intact."
     fi
 }
 
@@ -356,12 +570,11 @@ summarize_claude_content() {
 
 import_existing_top_level() {
     local target="$1"
-    local imported=0 f srv_dir srv_name
+    local f srv_dir srv_name
     for f in settings.json CLAUDE.md keybindings.json; do
         if [ -f "$CLAUDE_DIR/$f" ] && [ ! -L "$CLAUDE_DIR/$f" ]; then
             cp -p "$CLAUDE_DIR/$f" "$target/$f"
             echo "  imported $f"
-            imported=$((imported+1))
         fi
     done
     if [ -d "$CLAUDE_DIR/skills" ] && [ ! -L "$CLAUDE_DIR/skills" ] \
@@ -369,7 +582,6 @@ import_existing_top_level() {
         mkdir -p "$target/skills"
         cp -R "$CLAUDE_DIR/skills/." "$target/skills/"
         echo "  imported skills/"
-        imported=$((imported+1))
     fi
     if [ -d "$CLAUDE_DIR/mcp-servers" ] && [ ! -L "$CLAUDE_DIR/mcp-servers" ]; then
         local any=false
@@ -377,22 +589,22 @@ import_existing_top_level() {
             [ ! -d "$srv_dir" ] && continue
             srv_name="$(basename "$srv_dir")"
             mkdir -p "$target/mcp-servers/$srv_name"
-            cp -R "$srv_dir." "$target/mcp-servers/$srv_name/"
+            cp -R "$srv_dir/." "$target/mcp-servers/$srv_name/"
             rm -rf "$target/mcp-servers/$srv_name/.venv"
             any=true
         done
-        [ "$any" = true ] && { echo "  imported mcp-servers/"; imported=$((imported+1)); }
+        [ "$any" = true ] && echo "  imported mcp-servers/"
     fi
     return 0
 }
 
 write_data_repo_scaffold() {
     local target="$1"
-    if [ ! -d "$target/.git" ]; then
+    if [ "$BACKEND" = "git" ] && [ ! -d "$target/.git" ]; then
         git -C "$target" init -q -b main 2>/dev/null || git -C "$target" init -q
     fi
     cat > "$target/.gitignore" <<'EOF'
-# claude-sync data repo — allowlist style.
+# claude-sync data directory — allowlist style.
 # Ignore everything by default, then re-enable what should sync.
 *
 
@@ -433,8 +645,10 @@ print_init_next_steps() {
     echo "Next steps:"
     echo "  1. Add to your shell profile (e.g. ~/.zshrc):"
     echo "       export CLAUDE_SYNC_DIR=\"$target\""
+    [ "$BACKEND" != "git" ] && echo "       export CLAUDE_SYNC_BACKEND=\"$BACKEND\""
+    [ -n "$STORAGE_URI" ] && echo "       export CLAUDE_SYNC_STORAGE_URI=\"$STORAGE_URI\""
     [ -n "$WORKDIR" ] && echo "       export CLAUDE_SYNC_WORKDIR=\"$WORKDIR\""
-    if [ "$include_remote" = true ]; then
+    if [ "$BACKEND" = "git" ] && [ "$include_remote" = true ]; then
         echo "  2. Add a private remote (recommended):"
         echo "       git -C \"$target\" remote add origin git@github.com:USER/REPO.git"
         echo "  3. Set up symlinks:"
@@ -464,7 +678,7 @@ do_init_create() {
         migrate_local_memory
         echo "Created $target with existing config imported."
     else
-        echo "Initialized empty claude-sync data repo at $target"
+        echo "Initialized empty claude-sync data directory at $target"
     fi
     print_init_next_steps "$target" true
 }
@@ -491,32 +705,32 @@ do_init() {
         echo "Found existing Claude Code data in $CLAUDE_DIR:"
         summarize_claude_content
         echo
-        if prompt_yn "Make this a syncable config repo (all files including project memory)?"; then
+        if prompt_yn "Make this a syncable data directory (all files including project memory)?"; then
             import=true
         fi
         echo
     fi
 
     if [ "$import" = false ]; then
-        if prompt_yn "Do you already have a claude-sync data repo on disk?" n; then
+        if prompt_yn "Do you already have a claude-sync data directory on disk?" n; then
             use_existing=true
         fi
         echo
     fi
 
     if [ "$use_existing" = true ]; then
-        target="$(prompt_path "Repo path" "")"
+        target="$(prompt_path "Data directory path" "")"
         if [ -z "$target" ] || [ ! -d "$target" ]; then
             echo "ERROR: $target does not exist." >&2
             exit 1
         fi
         target="$(cd "$target" && pwd)"
-        echo "Using existing repo at $target."
+        echo "Using existing data directory at $target."
         print_init_next_steps "$target" false
         return 0
     fi
 
-    target="$(prompt_path "Repo path" "$HOME/.claude-config-data")"
+    target="$(prompt_path "Data directory path" "$HOME/.claude-config-data")"
     do_init_create "$target" "$import"
 }
 
@@ -525,15 +739,15 @@ print_usage() {
 Usage: claude-sync [-p PREFIX] [-w WORKDIR] <command>
 
 Commands:
-  init [dir]   initialize a data repo (interactive wizard if dir omitted —
+  init [dir]   initialize a data directory (interactive wizard if dir omitted —
                detects existing ~/.claude/ content and offers to import)
-  sync         pull + push + link (default)
-  push         commit and push local changes
-  pull         pull remote changes + link
+  sync         backend sync + link (default)
+  push         push local data to the configured backend
+  pull         pull backend data + link
   link         set up / refresh symlinks
-  unlink       remove repo-owned symlinks (keeps repo)
+  unlink       remove data-directory-owned symlinks
   clean        remove broken symlinks from ~/.claude/projects
-  status       show repo, projects, link health, and changes
+  status       show data directory, backend, projects, link health, and changes
   help         show this message
 
 Options:
@@ -541,14 +755,21 @@ Options:
   -w, --workdir DIR     work directory under $HOME (default: $CLAUDE_SYNC_WORKDIR)
 
 Environment:
-  CLAUDE_SYNC_DIR       path to your private config repo (required for
+  CLAUDE_SYNC_DIR       path to your private data directory (required for
                         every command except `init` and `help`)
+  CLAUDE_SYNC_BACKEND   storage backend: git, s3, gcs, or local (default: git)
+  CLAUDE_SYNC_STORAGE_URI
+                        s3://bucket/prefix or gs://bucket/prefix for object
+                        storage backends
+  CLAUDE_SYNC_STORAGE_OBJECT
+                        object name for s3/gcs archive
+                        (default: claude-sync-data.tar.gz)
   CLAUDE_SYNC_WORKDIR   parent dir under $HOME to strip from canonical
                         project names (e.g. "develop" strips ~/develop/)
-  CLAUDE_SYNC_REMOTE    git remote name (default: origin)
+  CLAUDE_SYNC_REMOTE    git remote name for backend git (default: origin)
 
-The branch your data repo is currently on is used for push/pull, so
-`main`, `master`, or any other branch works.
+For backend git, the branch your data directory is currently on is used for
+push/pull, so `main`, `master`, or any other branch works.
 USAGE
 }
 
@@ -576,34 +797,40 @@ case "$ACTION" in
         ;;
     push)
         cd "$REPO_DIR"
-        require_remote
         migrate_local_memory
-        git add -A
-        if git diff --cached --quiet; then
-            echo "Nothing to push."
+        backend_require
+        if [ "$BACKEND" = "git" ]; then
+            if git_commit_if_needed; then
+                backend_push
+                echo "Pushed."
+            else
+                echo "Nothing to push."
+            fi
         else
-            git commit -m "sync: $(hostname) $(date '+%Y-%m-%d %H:%M')"
-            git push "$REMOTE" "$(git_branch)"
+            backend_push
             echo "Pushed."
         fi
         ;;
     pull)
         cd "$REPO_DIR"
-        require_remote
-        git_pull_rebase
+        backend_require
+        backend_pull
         do_link
         echo "Pulled."
         ;;
     sync)
         cd "$REPO_DIR"
-        require_remote
-        migrate_local_memory
-        git add -A
-        if ! git diff --cached --quiet; then
-            git commit -m "sync: $(hostname) $(date '+%Y-%m-%d %H:%M')"
+        backend_require
+        if [ "$BACKEND" = "git" ]; then
+            migrate_local_memory
+            git_commit_if_needed || true
+            backend_pull
+            backend_push
+        else
+            backend_pull
+            migrate_local_memory
+            backend_push
         fi
-        git_pull_rebase
-        git push "$REMOTE" "$(git_branch)"
         do_link
         echo "Synced."
         ;;
@@ -614,14 +841,19 @@ case "$ACTION" in
         ;;
     status)
         cd "$REPO_DIR"
-        echo "Repo:    $REPO_DIR"
+        echo "Data:    $REPO_DIR"
+        echo "Backend: $BACKEND"
         echo "Prefix:  $PREFIX"
         [ -n "$WORKDIR" ] && echo "Workdir: ~/$WORKDIR"
-        if git remote get-url "$REMOTE" >/dev/null 2>&1; then
+        if [ "$BACKEND" = "git" ] && git remote get-url "$REMOTE" >/dev/null 2>&1; then
             echo "Remote:  $REMOTE ($(git remote get-url "$REMOTE"))"
             echo "Branch:  $(git_branch)"
-        else
+        elif [ "$BACKEND" = "s3" ] || [ "$BACKEND" = "gcs" ]; then
+            echo "Storage: $(storage_object_uri)"
+        elif [ "$BACKEND" = "git" ]; then
             echo "Remote:  (none configured)"
+        else
+            echo "Storage: local only"
         fi
         echo ""
 
@@ -671,10 +903,11 @@ case "$ACTION" in
             else
                 local dest
                 dest="$(readlink "$target")"
-                case "$dest" in
-                    "$expect_prefix"*) : ;;
-                    *) health_lines="${health_lines}  foreign      $label -> $dest"$'\n' ;;
-                esac
+                if [[ "$dest" == "$expect_prefix"* ]]; then
+                    :
+                else
+                    health_lines="${health_lines}  foreign      $label -> $dest"$'\n'
+                fi
             fi
         }
         for f in settings.json keybindings.json CLAUDE.md; do
@@ -698,10 +931,12 @@ case "$ACTION" in
             echo ""
         fi
 
-        changes="$(git status --short)"
-        if [ -z "$changes" ]; then
-            echo "No changes."
+        if [ "$BACKEND" = "git" ] && [ -d "$REPO_DIR/.git" ]; then
+            changes="$(git status --short)"
         else
+            changes=""
+        fi
+        if [ -n "$changes" ]; then
             echo "Changes:"
             shown_projects=""
             other_lines=""
@@ -732,6 +967,8 @@ case "$ACTION" in
                     echo "    $line"
                 done <<< "$other_lines"
             fi
+        elif [ "$BACKEND" = "git" ]; then
+            echo "No changes."
         fi
         ;;
     *)

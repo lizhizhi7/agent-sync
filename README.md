@@ -1,38 +1,40 @@
 # claude-sync
 
-> Sync your [Claude Code](https://docs.anthropic.com/en/docs/claude-code) config and project memory across devices via git.
+Sync your [Claude Code](https://docs.anthropic.com/en/docs/claude-code) config and project memory across devices.
 
-**The problem.** Claude Code keeps all your settings, custom skills, MCP servers, and per-project memory locally under `~/.claude/`. If you use Claude Code on more than one machine — laptop and desktop, mac and Linux, work and home — you lose context every time you switch. Memory you wrote on one device isn't visible on the other.
+Claude Code keeps settings, custom skills, MCP servers, and per-project memory locally under `~/.claude/`. `claude-sync` keeps the syncable subset in a private local data directory, links that directory back into `~/.claude/`, and can move the data through git, S3, GCS, or a local-only backend.
 
-**The fix.** A tiny bash tool that symlinks a git-backed config directory into `~/.claude/`. Push from one device, pull from the next, and your full Claude Code state moves with you.
-
-## What gets synced
+## What Gets Synced
 
 | Item | Synced |
 |---|---|
-| `settings.json` (permissions, plugins, status line) | ✓ |
-| `keybindings.json` | ✓ |
-| Global `CLAUDE.md` | ✓ |
-| Custom skills (`skills/`) | ✓ |
-| Custom MCP servers (`mcp-servers/`) | ✓ (code only; device-local `.venv/` is preserved) |
-| Project memory (`projects/*/memory/`) | ✓ |
-| Conversation logs, cache, sessions, telemetry | ✗ (stay local) |
+| `settings.json` | Yes |
+| `keybindings.json` | Yes |
+| Global `CLAUDE.md` | Yes |
+| Custom skills, `skills/` | Yes |
+| Custom MCP server code, `mcp-servers/` | Yes, except device-local `.venv/` |
+| Project memory, `projects/*/memory/` | Yes |
+| Conversation logs, cache, sessions, telemetry | No |
 
-## How it works
+## How It Works
 
 Claude Code derives project directory names in `~/.claude/projects/` from absolute paths:
 
-```
+```text
 ~/.claude/projects/-Users-alice-dev-myapp/       # macOS
 ~/.claude/projects/-home-alice-dev-myapp/        # Linux
 ```
 
-These differ across devices because `$HOME` differs. `claude-sync` solves this by:
+Those names differ across devices because `$HOME` differs. `claude-sync` stores each project under a canonical name in the data directory, then creates device-specific symlinks on each machine.
 
-1. Storing each project under a **canonical name** in your repo (home prefix stripped): `-myapp`.
-2. Creating **device-specific symlinks** on each machine that point back to the canonical memory directory.
+For example:
 
-Settings, skills, `CLAUDE.md`, and MCP servers are symlinked from `~/.claude/` directly into your repo.
+```text
+$CLAUDE_SYNC_DIR/projects/-myapp/memory/
+~/.claude/projects/-Users-alice-dev-myapp/memory -> $CLAUDE_SYNC_DIR/projects/-myapp/memory
+```
+
+Top-level config files, skills, and MCP server source files are also symlinked from `~/.claude/` into the data directory. Existing local files are backed up under `~/.claude/backups/claude-sync-*` before being replaced by symlinks.
 
 ## Install
 
@@ -47,77 +49,76 @@ Or clone manually:
 ```bash
 git clone https://github.com/lizhizhi7/claude-sync.git ~/.local/share/claude-sync
 ln -sfn ~/.local/share/claude-sync/bin/claude-sync ~/.local/bin/claude-sync
-# make sure ~/.local/bin is on your $PATH
 ```
 
-Requires `bash`, `git`. Tested on macOS and Linux.
+Requires Bash and the CLI for your chosen backend:
 
-## Quick start
+| Backend | Required CLI |
+|---|---|
+| `git` | `git` |
+| `s3` | AWS CLI, `aws` |
+| `gcs` | Google Cloud CLI, `gcloud` |
+| `local` | none |
 
-### First device
+## Quick Start: Git Backend
 
-1. **Create a private git repo for your config.** GitHub, GitLab, self-hosted — anywhere git works. **Make it private** — it will contain your settings (possibly with tokens) and your project memory.
-
-2. **Initialize it locally:**
-
-   ```bash
-   claude-sync init ~/dotfiles/claude-config
-   ```
-
-   This creates the directory, runs `git init`, writes a `.gitignore` allowlisting only what should sync, and drops a `.claude-sync-data` marker.
-
-3. **Point `claude-sync` at it** (add to your shell profile):
-
-   ```bash
-   export CLAUDE_SYNC_DIR=~/dotfiles/claude-config
-   ```
-
-4. **Add your private remote:**
-
-   ```bash
-   git -C ~/dotfiles/claude-config remote add origin git@github.com:you/claude-config.git
-   ```
-
-5. **Symlink into `~/.claude/`:**
-
-   ```bash
-   claude-sync link
-   ```
-
-   If the device already has local Claude data, `link` migrates existing project memory into the repo automatically.
-
-6. **Push:**
-
-   ```bash
-   claude-sync sync
-   ```
-
-### Additional devices
+Create a private git repo for your config data. It can contain settings, project memory, and secrets from MCP server configuration, so do not make it public.
 
 ```bash
-# install the tool (same one-liner as above)
-curl -fsSL https://raw.githubusercontent.com/lizhizhi7/claude-sync/main/install.sh | bash
-
-# clone your config repo
-git clone git@github.com:you/claude-config.git ~/dotfiles/claude-config
-export CLAUDE_SYNC_DIR=~/dotfiles/claude-config   # add to .zshrc / .bashrc
-
-# link + pull
+claude-sync init ~/dotfiles/claude-config
+export CLAUDE_SYNC_DIR=~/dotfiles/claude-config
+git -C ~/dotfiles/claude-config remote add origin git@github.com:you/claude-config.git
 claude-sync link
+claude-sync sync
+```
+
+On another device:
+
+```bash
+git clone git@github.com:you/claude-config.git ~/dotfiles/claude-config
+export CLAUDE_SYNC_DIR=~/dotfiles/claude-config
 claude-sync pull
 ```
 
+## Object Storage Backends
+
+Object storage backends keep the same local data directory, but store its syncable content as one archive object. This avoids broad file syncing with fragile include/exclude rules.
+
+S3:
+
+```bash
+export CLAUDE_SYNC_BACKEND=s3
+export CLAUDE_SYNC_STORAGE_URI=s3://my-private-bucket/claude-sync
+export CLAUDE_SYNC_DIR=~/dotfiles/claude-config
+claude-sync init "$CLAUDE_SYNC_DIR"
+claude-sync sync
+```
+
+GCS:
+
+```bash
+export CLAUDE_SYNC_BACKEND=gcs
+export CLAUDE_SYNC_STORAGE_URI=gs://my-private-bucket/claude-sync
+export CLAUDE_SYNC_DIR=~/dotfiles/claude-config
+claude-sync init "$CLAUDE_SYNC_DIR"
+claude-sync sync
+```
+
+By default, the archive object is named `claude-sync-data.tar.gz`. Override it with `CLAUDE_SYNC_STORAGE_OBJECT`.
+
+Object storage has no merge/conflict resolution. Treat one device as the active writer, or use explicit `pull` before editing and `push` afterward.
+
 ## Commands
 
-```
-claude-sync init <dir>   create a new data repo at <dir>
-claude-sync              sync (pull + push + link)   [default]
-claude-sync push         commit and push local changes
-claude-sync pull         pull remote changes + link
-claude-sync link         set up / refresh symlinks
-claude-sync unlink       remove repo-owned symlinks (keeps the repo)
+```text
+claude-sync init [dir]   initialize a data directory
+claude-sync              sync through the configured backend + link
+claude-sync push         push local data to the backend
+claude-sync pull         pull backend data + link
+claude-sync link         set up or refresh symlinks
+claude-sync unlink       remove data-directory-owned symlinks only
 claude-sync clean        remove broken symlinks from ~/.claude/projects
-claude-sync status       show repo, projects, link health, and changes
+claude-sync status       show backend, projects, link health, and changes
 claude-sync help         show usage
 ```
 
@@ -125,39 +126,63 @@ claude-sync help         show usage
 
 | Env var | Meaning |
 |---|---|
-| `CLAUDE_SYNC_DIR` | Path to your private config repo. Required for every command except `init` and `help`. |
-| `CLAUDE_SYNC_WORKDIR` | Parent directory under `$HOME` to strip from canonical project names. e.g. `develop` strips `~/develop/` from paths. Per-device. |
-| `CLAUDE_SYNC_REMOTE` | Git remote name (default `origin`). |
+| `CLAUDE_SYNC_DIR` | Private local data directory. Required except for `init` and `help`. |
+| `CLAUDE_SYNC_BACKEND` | `git`, `s3`, `gcs`, or `local`. Default: `git`. |
+| `CLAUDE_SYNC_STORAGE_URI` | `s3://bucket/prefix` or `gs://bucket/prefix` for object storage. |
+| `CLAUDE_SYNC_STORAGE_OBJECT` | Archive object name. Default: `claude-sync-data.tar.gz`. |
+| `CLAUDE_SYNC_WORKDIR` | Parent directory under `$HOME` to strip from canonical project names. |
+| `CLAUDE_SYNC_REMOTE` | Git remote name. Default: `origin`. |
 
-The branch your data repo is currently on is used for push/pull, so `main`, `master`, or any other branch works.
+### Workdir Example
 
-### Workdir example
+If all projects live under `~/develop/`, set:
 
-Say all your projects live under `~/develop/`. Without `CLAUDE_SYNC_WORKDIR`, canonical names look like `-develop-myapp`. With `export CLAUDE_SYNC_WORKDIR=develop`, they collapse to `-myapp`, and a colleague whose projects live under `~/code/` can set `CLAUDE_SYNC_WORKDIR=code` to share canonical names.
+```bash
+export CLAUDE_SYNC_WORKDIR=develop
+```
 
-## Privacy
+Then `~/develop/myapp` is stored as `projects/-myapp` instead of `projects/-develop-myapp`.
 
-Your data repo will contain:
+## Privacy And Security
 
-- Your `settings.json` — **this may include MCP server tokens or other secrets** depending on how you've configured Claude Code.
-- Project memory files with your work context.
-- Custom skills and CLAUDE.md instructions.
+Your data directory can contain secrets and sensitive work context:
 
-**Use a private repo.** This is your responsibility — `claude-sync` does not encrypt or redact anything.
+- `settings.json` may include MCP server tokens or credentials.
+- Project memory may include private repository, customer, or product details.
+- Custom skills and global instructions may include internal workflows.
+
+Use a private git repo or private object storage bucket. `claude-sync` does not encrypt or redact data.
+
+Hardening built into the tool:
+
+- Refuses to operate on data directories without the `.claude-sync-data` marker.
+- Refuses to use a data directory inside `~/.claude/`.
+- Backs up existing local Claude files before replacing them with symlinks.
+- Removes symlinks only when their target is actually inside the configured data directory.
+- Preserves MCP server `.venv/` directories as device-local state.
+- Excludes conversation logs and `.venv/` directories from git/object-storage sync.
+
+## Development
+
+Run checks before publishing changes:
+
+```bash
+bash -n bin/claude-sync install.sh tests/run.sh
+tests/run.sh
+shellcheck bin/claude-sync install.sh tests/run.sh
+```
+
+The GitHub Actions workflow runs ShellCheck on pull requests.
 
 ## Uninstall
 
 ```bash
-claude-sync unlink                    # remove only repo-owned symlinks from ~/.claude/
-rm -rf ~/.local/share/claude-sync     # remove the tool
-rm ~/.local/bin/claude-sync           # remove the bin symlink
+claude-sync unlink
+rm -rf ~/.local/share/claude-sync
+rm ~/.local/bin/claude-sync
 ```
 
-Your data repo at `$CLAUDE_SYNC_DIR` is left intact.
-
-## Contributing
-
-The tool is a single bash script in `bin/claude-sync`. Run `shellcheck bin/claude-sync install.sh` before sending changes. Issues and PRs welcome.
+The data directory at `$CLAUDE_SYNC_DIR` is left intact.
 
 ## License
 
