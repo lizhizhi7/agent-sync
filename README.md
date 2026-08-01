@@ -143,6 +143,10 @@ claude-sync status       show backend, projects, link health, and changes
 claude-sync help         show usage
 ```
 
+Every command also accepts `-p PREFIX` / `--prefix` to override the
+auto-detected device prefix (derived from `$HOME`) and `-w DIR` / `--workdir`
+as a one-off alternative to `CLAUDE_SYNC_WORKDIR`.
+
 ## Project Matching
 
 Use `match` when the same project has different local Claude directory names across machines, or when you want to map a long local path-derived name to a shorter canonical project.
