@@ -6,6 +6,7 @@
 
 !.gitignore
 !.claude-sync-data
+!.claude-sync-projects
 !README.md
 
 # Top-level config

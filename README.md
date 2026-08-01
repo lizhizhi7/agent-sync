@@ -36,6 +36,21 @@ $CLAUDE_SYNC_DIR/projects/-myapp/memory/
 
 Top-level config files, skills, and MCP server source files are also symlinked from `~/.claude/` into the data directory. Existing local files are backed up under `~/.claude/backups/claude-sync-*` before being replaced by symlinks.
 
+When the automatic prefix rule is not enough, use explicit project mappings. Mappings are stored in:
+
+```text
+$CLAUDE_SYNC_DIR/.claude-sync-projects
+```
+
+Each line maps a local Claude project directory name to a canonical synced project:
+
+```text
+-Users-alice-develop-myapp -myapp
+-home-bob-code-myapp -myapp
+```
+
+`claude-sync link` honors those mappings before using the default prefix-based project name.
+
 ## Install
 
 One-line installer:
@@ -51,7 +66,7 @@ git clone https://github.com/lizhizhi7/claude-sync.git ~/.local/share/claude-syn
 ln -sfn ~/.local/share/claude-sync/bin/claude-sync ~/.local/bin/claude-sync
 ```
 
-Requires Bash and the CLI for your chosen backend:
+Requires Bash 3.2+ (the macOS system bash works) and the CLI for your chosen backend:
 
 | Backend | Required CLI |
 |---|---|
@@ -71,6 +86,9 @@ git -C ~/dotfiles/claude-config remote add origin git@github.com:you/claude-conf
 claude-sync link
 claude-sync sync
 ```
+
+The first `sync` against an empty remote skips the pull and just pushes, so a
+brand-new private repo needs no manual first commit.
 
 On another device:
 
@@ -116,10 +134,88 @@ claude-sync              sync through the configured backend + link
 claude-sync push         push local data to the backend
 claude-sync pull         pull backend data + link
 claude-sync link         set up or refresh symlinks
+claude-sync match        preview, apply, or set project mappings
+claude-sync agents       install/remove/status managed agent instructions
+claude-sync env          install/remove/status/print managed shell env block
 claude-sync unlink       remove data-directory-owned symlinks only
 claude-sync clean        remove broken symlinks from ~/.claude/projects
 claude-sync status       show backend, projects, link health, and changes
 claude-sync help         show usage
+```
+
+## Project Matching
+
+Use `match` when the same project has different local Claude directory names across machines, or when you want to map a long local path-derived name to a shorter canonical project.
+
+Preview suggested mappings without changing anything:
+
+```bash
+claude-sync match --dry-run
+```
+
+Run interactively (prompts per project; previews automatically when not attached to a terminal):
+
+```bash
+claude-sync match
+```
+
+Apply all suggestions from the current machine:
+
+```bash
+claude-sync match --auto
+```
+
+Apply one explicit mapping:
+
+```bash
+claude-sync match -Users-alice-develop-myapp:-myapp
+```
+
+`match` copies local memory into the canonical project with no clobbering, writes the mapping file, and replaces the local memory directory with a symlink to the canonical memory directory.
+
+## Agent Instructions
+
+`claude-sync` can detect supported agent tools and merge a managed instruction block that reminds them to use `claude-sync` for durable config and memory changes.
+
+Supported targets:
+
+| Tool | Instruction target |
+|---|---|
+| Claude Code | `$CLAUDE_SYNC_DIR/CLAUDE.md` |
+| Codex | `~/.codex/AGENTS.md` |
+
+Install or update the managed instruction block:
+
+```bash
+claude-sync agents install
+```
+
+Check what is installed:
+
+```bash
+claude-sync agents status
+```
+
+Remove only the managed instruction block:
+
+```bash
+claude-sync agents remove
+```
+
+## Shell Env Block
+
+`claude-sync env install` writes the current sync configuration to a marked block in your default shell profile. `remove` deletes only that marked block.
+
+```bash
+claude-sync env install
+claude-sync env status
+claude-sync env remove
+```
+
+To inspect the block without editing files:
+
+```bash
+claude-sync env print
 ```
 
 ## Configuration
@@ -157,27 +253,22 @@ Hardening built into the tool:
 
 - Refuses to operate on data directories without the `.claude-sync-data` marker.
 - Refuses to use a data directory inside `~/.claude/`.
+- For the git backend, refuses to run when the data directory is nested inside
+  another git repository (so `git add -A` can never stage files of an
+  unrelated enclosing repo) or sitting on a detached HEAD.
 - Backs up existing local Claude files before replacing them with symlinks.
 - Removes symlinks only when their target is actually inside the configured data directory.
 - Preserves MCP server `.venv/` directories as device-local state.
 - Excludes conversation logs and `.venv/` directories from git/object-storage sync.
-
-## Development
-
-Run checks before publishing changes:
-
-```bash
-bash -n bin/claude-sync install.sh tests/run.sh
-tests/run.sh
-shellcheck bin/claude-sync install.sh tests/run.sh
-```
-
-The GitHub Actions workflow runs ShellCheck on pull requests.
+- Validates object-storage archives before extraction: absolute paths, `..`
+  traversal, symlink members, and hardlink members are all rejected.
 
 ## Uninstall
 
 ```bash
-claude-sync unlink
+claude-sync unlink        # remove managed symlinks only
+claude-sync unlink --env  # also remove managed shell env blocks
+claude-sync agents remove # remove managed agent instructions
 rm -rf ~/.local/share/claude-sync
 rm ~/.local/bin/claude-sync
 ```

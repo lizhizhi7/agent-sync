@@ -17,6 +17,10 @@ STORAGE_URI="${CLAUDE_SYNC_STORAGE_URI:-}"
 STORAGE_OBJECT="${CLAUDE_SYNC_STORAGE_OBJECT:-claude-sync-data.tar.gz}"
 BACKUP_STAMP="$(date '+%Y%m%d-%H%M%S')"
 BACKUP_DIR="$CLAUDE_DIR/backups/claude-sync-$BACKUP_STAMP"
+ENV_BLOCK_START="# >>> claude-sync >>>"
+ENV_BLOCK_END="# <<< claude-sync <<<"
+AGENT_BLOCK_START="<!-- >>> claude-sync:auto-sync >>> -->"
+AGENT_BLOCK_END="<!-- <<< claude-sync:auto-sync <<< -->"
 
 die() {
     echo "ERROR: $*" >&2
@@ -29,6 +33,7 @@ PREFIX=""
 WORKDIR=""
 WORKDIR_SET=false
 ARGS=()
+UNLINK_ENV=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -p|--prefix)
@@ -43,20 +48,21 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         -h|--help)    ARGS+=("help"); shift ;;
+        --env)        UNLINK_ENV=true; shift ;;
         *)            ARGS+=("$1"); shift ;;
     esac
 done
 ACTION="${ARGS[0]:-sync}"
 ARG1="${ARGS[1]:-}"
 
-[ "$WORKDIR_SET" = false ] && [ -n "$CLAUDE_SYNC_WORKDIR" ] && WORKDIR="$CLAUDE_SYNC_WORKDIR"
+[ "$WORKDIR_SET" = false ] && [ -n "${CLAUDE_SYNC_WORKDIR:-}" ] && WORKDIR="$CLAUDE_SYNC_WORKDIR"
 [ -z "$PREFIX" ] && PREFIX="$(echo "$HOME" | tr '/' '-')"
 [ -n "$WORKDIR" ] && PREFIX="${PREFIX}-$(echo "$WORKDIR" | tr '/' '-')"
 
 # ---------- data directory resolution ----------
 
 resolve_repo_dir() {
-    if [ -z "$CLAUDE_SYNC_DIR" ]; then
+    if [ -z "${CLAUDE_SYNC_DIR:-}" ]; then
         echo "ERROR: CLAUDE_SYNC_DIR is not set." >&2
         echo "" >&2
         echo "  Point it at your private data directory:" >&2
@@ -71,7 +77,7 @@ resolve_repo_dir() {
         exit 1
     fi
     local dir
-    dir="$(cd "$CLAUDE_SYNC_DIR" && pwd)"
+    dir="$(cd "$CLAUDE_SYNC_DIR" && pwd -P)"
     if [ "$dir" = "$CLAUDE_DIR" ] || [[ "$dir" == "$CLAUDE_DIR"/* ]]; then
         echo "ERROR: CLAUDE_SYNC_DIR must not be inside $CLAUDE_DIR." >&2
         exit 1
@@ -129,6 +135,53 @@ copy_tree_no_clobber() {
     cp -pRn "$src/." "$dst/" 2>/dev/null || true
 }
 
+shell_quote() {
+    printf '%q' "$1"
+}
+
+remove_managed_block() {
+    local file="$1" start="$2" end="$3" tmp
+    [ -f "$file" ] || return 0
+    tmp="$(mktemp)"
+    awk -v start="$start" -v end="$end" '
+        $0 == start { skip = 1; next }
+        $0 == end { skip = 0; next }
+        skip != 1 { print }
+    ' "$file" > "$tmp"
+    mv "$tmp" "$file"
+}
+
+write_managed_block() {
+    local file="$1" start="$2" end="$3" body="$4" need_blank=false
+    mkdir -p "$(dirname "$file")"
+    [ -f "$file" ] || touch "$file"
+    remove_managed_block "$file" "$start" "$end"
+    [ -s "$file" ] && need_blank=true
+    {
+        [ "$need_blank" = true ] && printf '\n'
+        printf '%s\n' "$start"
+        printf '%s\n' "$body"
+        printf '%s\n' "$end"
+    } >> "$file"
+}
+
+managed_block_present() {
+    local file="$1" start="$2"
+    [ -f "$file" ] && grep -Fqx "$start" "$file"
+}
+
+default_shell_profile() {
+    case "$(basename "${SHELL:-}")" in
+        zsh) printf '%s\n' "$HOME/.zshrc" ;;
+        bash) printf '%s\n' "$HOME/.bashrc" ;;
+        *) printf '%s\n' "$HOME/.profile" ;;
+    esac
+}
+
+env_profiles() {
+    printf '%s\n' "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile"
+}
+
 git_branch() {
     git -C "$REPO_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null
 }
@@ -145,6 +198,10 @@ require_remote() {
 git_pull_rebase() {
     local branch
     branch="$(git_branch)"
+    if ! git -C "$REPO_DIR" ls-remote --exit-code --heads "$REMOTE" "$branch" >/dev/null 2>&1; then
+        echo "Remote branch '$branch' not on '$REMOTE' yet; skipping pull."
+        return 0
+    fi
     if ! git -C "$REPO_DIR" pull --rebase "$REMOTE" "$branch"; then
         echo "" >&2
         echo "ERROR: rebase failed in $REPO_DIR." >&2
@@ -162,7 +219,7 @@ storage_object_uri() {
 create_storage_archive() {
     local archive="$1" stage path
     stage="$(mktemp -d)"
-    for path in .gitignore .claude-sync-data README.md settings.json CLAUDE.md keybindings.json skills mcp-servers projects; do
+    for path in .gitignore .claude-sync-data .claude-sync-projects README.md settings.json CLAUDE.md keybindings.json skills mcp-servers projects; do
         [ -e "$REPO_DIR/$path" ] || continue
         cp -pR "$REPO_DIR/$path" "$stage/$path"
     done
@@ -177,7 +234,7 @@ create_storage_archive() {
 }
 
 validate_storage_archive() {
-    local archive="$1" path
+    local archive="$1" path line
     while IFS= read -r path; do
         case "$path" in
             /*|../*|*/../*|*/..)
@@ -185,6 +242,15 @@ validate_storage_archive() {
                 ;;
         esac
     done < <(tar -tzf "$archive")
+    # Reject symlink and hardlink members BEFORE extraction: extracting a
+    # symlink and then a member whose path passes through it writes outside
+    # the extraction directory.
+    while IFS= read -r line; do
+        case "$line" in
+            l*) die "refusing to extract archive containing symlink: $line" ;;
+            h*) die "refusing to extract archive containing hardlink: $line" ;;
+        esac
+    done < <(tar -tvzf "$archive")
 }
 
 extract_storage_archive() {
@@ -202,6 +268,7 @@ clear_synced_data_paths() {
         "$REPO_DIR/settings.json" \
         "$REPO_DIR/keybindings.json" \
         "$REPO_DIR/CLAUDE.md" \
+        "$REPO_DIR/.claude-sync-projects" \
         "$REPO_DIR/skills" \
         "$REPO_DIR/mcp-servers" \
         "$REPO_DIR/projects"; do
@@ -211,9 +278,17 @@ clear_synced_data_paths() {
 }
 
 backend_require() {
+    local top branch
     case "$BACKEND" in
         git)
             command_exists git || die "git is required for backend 'git'."
+            top="$(git -C "$REPO_DIR" rev-parse --show-toplevel 2>/dev/null)" \
+                || die "backend 'git': $REPO_DIR is not a git repository. Run: git -C \"$REPO_DIR\" init"
+            [ "$top" = "$REPO_DIR" ] \
+                || die "backend 'git': $REPO_DIR is inside another git repository ($top). Initialize it as its own repository first."
+            branch="$(git_branch)"
+            [ "$branch" != "HEAD" ] \
+                || die "backend 'git': $REPO_DIR is on a detached HEAD; check out a branch first."
             require_remote
             ;;
         s3)
@@ -311,10 +386,88 @@ git_commit_if_needed() {
     if git diff --cached --quiet; then
         return 1
     fi
-    git commit -m "sync: $(hostname) $(date '+%Y-%m-%d %H:%M')"
+    git commit -m "sync: $(hostname 2>/dev/null || uname -n) $(date '+%Y-%m-%d %H:%M')"
 }
 
 # ---------- linking ----------
+
+validate_project_name() {
+    local name="$1"
+    [ -n "$name" ] || die "empty project name"
+    case "$name" in
+        .|..|*/*|*$'\n'*)
+            die "invalid project name '$name'"
+            ;;
+    esac
+}
+
+canonical_for_device_project() {
+    local device_name="$1" mapped
+    mapped="$(project_mapping_lookup "$device_name")"
+    if [ -n "$mapped" ]; then
+        printf '%s\n' "$mapped"
+    elif [ "$device_name" = "$PREFIX" ]; then
+        printf '%s\n' "_home"
+    elif [[ "$device_name" == "$PREFIX"-* ]]; then
+        printf '%s\n' "${device_name#"$PREFIX"}"
+    elif [[ "$device_name" == "$PREFIX"* ]]; then
+        printf '%s\n' "${device_name#"$PREFIX"}"
+    else
+        printf '%s\n' "$device_name"
+    fi
+}
+
+project_mapping_lookup() {
+    local local_name="$1" map_file line lhs rhs
+    map_file="$REPO_DIR/.claude-sync-projects"
+    [ -f "$map_file" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            ""|\#*) continue ;;
+        esac
+        lhs="${line%%[[:space:]]*}"
+        rhs="${line#"$lhs"}"
+        rhs="${rhs#"${rhs%%[![:space:]]*}"}"
+        [ "$lhs" = "$local_name" ] || continue
+        printf '%s\n' "$rhs"
+        return 0
+    done < "$map_file"
+}
+
+write_project_mapping() {
+    local local_name="$1" canonical="$2" map_file tmp line lhs
+    validate_project_name "$local_name"
+    validate_project_name "$canonical"
+    map_file="$REPO_DIR/.claude-sync-projects"
+    tmp="$(mktemp)"
+    if [ -f "$map_file" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+                ""|\#*) printf '%s\n' "$line" >> "$tmp"; continue ;;
+            esac
+            lhs="${line%%[[:space:]]*}"
+            [ "$lhs" = "$local_name" ] && continue
+            printf '%s\n' "$line" >> "$tmp"
+        done < "$map_file"
+    fi
+    printf '%s %s\n' "$local_name" "$canonical" >> "$tmp"
+    mv "$tmp" "$map_file"
+}
+
+apply_project_mapping() {
+    local local_name="$1" canonical="$2" local_mem canonical_mem
+    validate_project_name "$local_name"
+    validate_project_name "$canonical"
+    local_mem="$CLAUDE_DIR/projects/$local_name/memory"
+    canonical_mem="$REPO_DIR/projects/$canonical/memory"
+    mkdir -p "$canonical_mem"
+    if [ -d "$local_mem" ] && [ ! -L "$local_mem" ]; then
+        copy_tree_no_clobber "$local_mem" "$canonical_mem"
+    fi
+    write_project_mapping "$local_name" "$canonical"
+    make_link "$canonical_mem" "$local_mem"
+    echo "  mapped $local_name -> $canonical"
+}
 
 link_configs() {
     mkdir -p "$CLAUDE_DIR"
@@ -331,38 +484,32 @@ link_configs() {
     fi
     if [ -d "$REPO_DIR/mcp-servers" ]; then
         mkdir -p "$CLAUDE_DIR/mcp-servers"
-        local srv_dir srv_name target venv_backup inner
+        local srv_dir srv_name target inner inner_name dest
         for srv_dir in "$REPO_DIR"/mcp-servers/*/; do
             [ ! -d "$srv_dir" ] && continue
             srv_name="$(basename "$srv_dir")"
             target="$CLAUDE_DIR/mcp-servers/$srv_name"
-            if [ -d "$target/.venv" ]; then
-                venv_backup="$(mktemp -d)"
-                mv "$target/.venv" "$venv_backup/.venv"
-                if [ -L "$target" ]; then
-                    rm -f "$target"
-                elif [ -e "$target" ]; then
-                    backup_path "$target"
-                fi
-                mkdir -p "$target"
-                for inner in "$srv_dir"*; do
-                    [ ! -e "$inner" ] && continue
-                    ln -sf "$inner" "$target/$(basename "$inner")"
-                done
-                mv "$venv_backup/.venv" "$target/.venv"
-                rm -rf "$venv_backup"
-            else
-                if [ -L "$target" ]; then
-                    rm -f "$target"
-                elif [ -e "$target" ]; then
-                    backup_path "$target"
-                fi
-                mkdir -p "$target"
-                for inner in "$srv_dir"*; do
-                    [ ! -e "$inner" ] && continue
-                    ln -sf "$inner" "$target/$(basename "$inner")"
-                done
+            # A whole-directory symlink (from an older layout) would shadow
+            # the per-file links; replace it with a real directory.
+            if [ -L "$target" ]; then
+                rm -f "$target"
             fi
+            mkdir -p "$target"
+            for inner in "$srv_dir"* "$srv_dir".[!.]* "$srv_dir"..?*; do
+                [ -e "$inner" ] || [ -L "$inner" ] || continue
+                inner_name="$(basename "$inner")"
+                [ "$inner_name" = ".venv" ] && continue
+                make_link "$inner" "$target/$inner_name"
+            done
+            # Prune stale links to files removed from the data directory,
+            # leaving device-local entries (like .venv) alone.
+            for inner in "$target"/* "$target"/.[!.]* "$target"/..?*; do
+                [ -L "$inner" ] || continue
+                dest="$(readlink "$inner")"
+                if is_repo_target "$dest" && [ ! -e "$inner" ]; then
+                    rm -f "$inner"
+                fi
+            done
             echo "  linked mcp-server: $srv_name"
         done
     fi
@@ -370,7 +517,24 @@ link_configs() {
 
 link_projects() {
     mkdir -p "$CLAUDE_DIR/projects"
-    local count=0 canonical_mem canonical device_name
+    local count=0 canonical_mem canonical device_name map_file line local_name mapped
+    map_file="$REPO_DIR/.claude-sync-projects"
+    if [ -f "$map_file" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+                ""|\#*) continue ;;
+            esac
+            local_name="${line%%[[:space:]]*}"
+            mapped="${line#"$local_name"}"
+            mapped="${mapped#"${mapped%%[![:space:]]*}"}"
+            [ -n "$mapped" ] || continue
+            validate_project_name "$local_name"
+            validate_project_name "$mapped"
+            mkdir -p "$REPO_DIR/projects/$mapped/memory" "$CLAUDE_DIR/projects/$local_name"
+            make_link "$REPO_DIR/projects/$mapped/memory" "$CLAUDE_DIR/projects/$local_name/memory"
+            count=$((count + 1))
+        done < "$map_file"
+    fi
     for canonical_mem in "$REPO_DIR"/projects/*/memory; do
         [ ! -d "$canonical_mem" ] && continue
         canonical="$(basename "$(dirname "$canonical_mem")")"
@@ -399,7 +563,7 @@ migrate_local_memory() {
         [ ! -d "$device_mem" ] && continue
         [ -L "$device_mem" ] && continue
         device_dir="$(basename "$(dirname "$device_mem")")"
-        canonical="${device_dir#"$PREFIX"}"
+        canonical="$(canonical_for_device_project "$device_dir")"
         mkdir -p "$REPO_DIR/projects/$canonical/memory"
         copy_tree_no_clobber "$device_mem" "$REPO_DIR/projects/$canonical/memory"
         count=$((count + 1))
@@ -458,7 +622,7 @@ do_unlink() {
             [ ! -d "$srv_dir" ] && continue
             srv_name="$(basename "$srv_dir")"
             touched=false
-            for inner in "$srv_dir"*; do
+            for inner in "$srv_dir"* "$srv_dir".[!.]* "$srv_dir"..?*; do
                 [ ! -e "$inner" ] && [ ! -L "$inner" ] && continue
                 if [ -L "$inner" ]; then
                     dest="$(readlink "$inner")"
@@ -494,6 +658,235 @@ do_unlink() {
     else
         echo "Unlinked $removed item(s). Data directory at $REPO_DIR is intact."
     fi
+    if [ "$UNLINK_ENV" = true ]; then
+        do_env remove
+    fi
+}
+
+env_block_body() {
+    local body
+    body="export CLAUDE_SYNC_DIR=$(shell_quote "$REPO_DIR")"
+    body="${body}"$'\n'"export CLAUDE_SYNC_BACKEND=$(shell_quote "$BACKEND")"
+    [ -n "$STORAGE_URI" ] && body="${body}"$'\n'"export CLAUDE_SYNC_STORAGE_URI=$(shell_quote "$STORAGE_URI")"
+    [ -n "$STORAGE_OBJECT" ] && [ "$STORAGE_OBJECT" != "claude-sync-data.tar.gz" ] \
+        && body="${body}"$'\n'"export CLAUDE_SYNC_STORAGE_OBJECT=$(shell_quote "$STORAGE_OBJECT")"
+    [ -n "$WORKDIR" ] && body="${body}"$'\n'"export CLAUDE_SYNC_WORKDIR=$(shell_quote "$WORKDIR")"
+    [ -n "$REMOTE" ] && [ "$REMOTE" != "origin" ] && body="${body}"$'\n'"export CLAUDE_SYNC_REMOTE=$(shell_quote "$REMOTE")"
+    printf '%s\n' "$body"
+}
+
+do_env() {
+    local sub="${1:-status}" profile found=false
+    case "$sub" in
+        install)
+            profile="$(default_shell_profile)"
+            write_managed_block "$profile" "$ENV_BLOCK_START" "$ENV_BLOCK_END" "$(env_block_body)"
+            echo "Installed claude-sync env block in $profile"
+            ;;
+        remove|clean)
+            while IFS= read -r profile; do
+                if managed_block_present "$profile" "$ENV_BLOCK_START"; then
+                    remove_managed_block "$profile" "$ENV_BLOCK_START" "$ENV_BLOCK_END"
+                    echo "Removed claude-sync env block from $profile"
+                    found=true
+                fi
+            done < <(env_profiles)
+            [ "$found" = true ] || echo "No managed claude-sync env blocks found."
+            ;;
+        status)
+            while IFS= read -r profile; do
+                if managed_block_present "$profile" "$ENV_BLOCK_START"; then
+                    echo "managed env block: $profile"
+                    found=true
+                fi
+            done < <(env_profiles)
+            [ "$found" = true ] || echo "No managed claude-sync env blocks found."
+            ;;
+        print)
+            printf '%s\n' "$ENV_BLOCK_START"
+            env_block_body
+            printf '%s\n' "$ENV_BLOCK_END"
+            ;;
+        *)
+            die "unknown env command '$sub' (expected install, remove, status, or print)"
+            ;;
+    esac
+}
+
+agent_instruction_body() {
+    cat <<'EOF'
+Use claude-sync for durable Claude Code configuration and memory changes on this machine:
+
+- Run `claude-sync status` before changing synced config or project memory when context is unclear.
+- Run `claude-sync match` if a project appears under a new local project name.
+- Run `claude-sync sync` after changes that should be shared across devices.
+- Do not edit shell profiles, unlink synced files, or delete local Claude data unless the user asks.
+EOF
+}
+
+detect_agent_targets() {
+    if command_exists claude || [ -d "$CLAUDE_DIR" ] || [ -f "$REPO_DIR/CLAUDE.md" ]; then
+        printf '%s\t%s\n' "Claude Code" "$REPO_DIR/CLAUDE.md"
+    fi
+    if command_exists codex || [ -d "$HOME/.codex" ] || [ -f "$HOME/.codex/AGENTS.md" ]; then
+        printf '%s\t%s\n' "Codex" "$HOME/.codex/AGENTS.md"
+    fi
+}
+
+do_agents() {
+    local sub="${1:-status}" found=false name target
+    case "$sub" in
+        install)
+            while IFS=$'\t' read -r name target; do
+                [ -n "$name" ] || continue
+                write_managed_block "$target" "$AGENT_BLOCK_START" "$AGENT_BLOCK_END" "$(agent_instruction_body)"
+                echo "Installed claude-sync agent instruction for $name: $target"
+                found=true
+            done < <(detect_agent_targets)
+            [ "$found" = true ] || echo "No supported agent tools detected."
+            ;;
+        remove|clean)
+            while IFS=$'\t' read -r name target; do
+                [ -n "$name" ] || continue
+                if managed_block_present "$target" "$AGENT_BLOCK_START"; then
+                    remove_managed_block "$target" "$AGENT_BLOCK_START" "$AGENT_BLOCK_END"
+                    echo "Removed claude-sync agent instruction for $name: $target"
+                    found=true
+                fi
+            done < <(detect_agent_targets)
+            [ "$found" = true ] || echo "No managed claude-sync agent instructions found."
+            ;;
+        status)
+            while IFS=$'\t' read -r name target; do
+                [ -n "$name" ] || continue
+                if managed_block_present "$target" "$AGENT_BLOCK_START"; then
+                    echo "$name: managed instruction installed at $target"
+                else
+                    echo "$name: detected, no managed instruction at $target"
+                fi
+                found=true
+            done < <(detect_agent_targets)
+            [ "$found" = true ] || echo "No supported agent tools detected."
+            ;;
+        *)
+            die "unknown agents command '$sub' (expected install, remove, or status)"
+            ;;
+    esac
+}
+
+project_link_state() {
+    local mem="$1" dest
+    if [ -L "$mem" ]; then
+        if [ ! -e "$mem" ]; then
+            printf '%s\n' "broken"
+        else
+            dest="$(readlink "$mem")"
+            if is_repo_target "$dest"; then
+                printf '%s\n' "linked"
+            else
+                printf '%s\n' "foreign"
+            fi
+        fi
+    elif [ -d "$mem" ]; then
+        printf '%s\n' "local"
+    else
+        printf '%s\n' "missing"
+    fi
+}
+
+print_project_match_row() {
+    local local_name="$1" state="$2" canonical="$3"
+    printf '  %-10s %-48s -> %s\n' "$state" "$local_name" "$canonical"
+}
+
+do_match() {
+    local dry_run=false auto=false explicit=false arg local_name canonical
+    local projects_dir="$CLAUDE_DIR/projects"
+    local mem device_dir state suggestion applied=0 seen=0
+    local i=1
+
+    while [ "$i" -lt "${#ARGS[@]}" ]; do
+        arg="${ARGS[$i]}"
+        case "$arg" in
+            --auto)
+                auto=true
+                ;;
+            --dry-run)
+                dry_run=true
+                ;;
+            *:*)
+                local_name="${arg%%:*}"
+                canonical="${arg#*:}"
+                apply_project_mapping "$local_name" "$canonical"
+                explicit=true
+                applied=$((applied + 1))
+                ;;
+            *)
+                die "unknown match argument '$arg'"
+                ;;
+        esac
+        i=$((i + 1))
+    done
+
+    if [ "$explicit" = true ]; then
+        echo "Applied $applied explicit mapping(s)."
+        return 0
+    fi
+    if [ "$auto" = false ] && [ "$dry_run" = false ] && { [ ! -t 0 ] || [ ! -t 1 ]; }; then
+        dry_run=true
+    fi
+
+    echo "Project match scan"
+    echo "Data:   $REPO_DIR"
+    echo "Prefix: $PREFIX"
+    echo ""
+
+    if [ ! -d "$projects_dir" ]; then
+        echo "No local Claude projects found."
+        return 0
+    fi
+
+    for mem in "$projects_dir"/*/memory; do
+        [ -e "$mem" ] || [ -L "$mem" ] || continue
+        device_dir="$(basename "$(dirname "$mem")")"
+        state="$(project_link_state "$mem")"
+        suggestion="$(canonical_for_device_project "$device_dir")"
+        seen=$((seen + 1))
+
+        case "$state" in
+            linked)
+                print_project_match_row "$device_dir" "$state" "$suggestion"
+                ;;
+            local)
+                print_project_match_row "$device_dir" "$state" "$suggestion"
+                if [ "$dry_run" = true ]; then
+                    :
+                elif [ "$auto" = true ]; then
+                    apply_project_mapping "$device_dir" "$suggestion"
+                    applied=$((applied + 1))
+                elif [ -t 0 ] && [ -t 1 ]; then
+                    if prompt_yn "Map $device_dir to $suggestion?"; then
+                        apply_project_mapping "$device_dir" "$suggestion"
+                        applied=$((applied + 1))
+                    fi
+                fi
+                ;;
+            broken|foreign)
+                print_project_match_row "$device_dir" "$state" "$suggestion"
+                ;;
+        esac
+    done
+
+    if [ "$seen" -eq 0 ]; then
+        echo "No local Claude project memory directories found."
+    elif [ "$dry_run" = true ]; then
+        echo ""
+        echo "Preview only. Use 'claude-sync match --auto' to apply suggestions,"
+        echo "or 'claude-sync match LOCAL:CANONICAL' for an explicit mapping."
+    elif [ "$applied" -gt 0 ]; then
+        echo ""
+        echo "Applied $applied project mapping(s)."
+    fi
 }
 
 prompt_yn() {
@@ -517,6 +910,7 @@ prompt_path() {
     else
         read -r -p "$q: " reply </dev/tty || return 1
     fi
+    # shellcheck disable=SC2088  # matching a literal leading tilde in user input
     case "$reply" in
         "~"|"~/"*) reply="$HOME${reply#\~}" ;;
     esac
@@ -610,6 +1004,7 @@ write_data_repo_scaffold() {
 
 !.gitignore
 !.claude-sync-data
+!.claude-sync-projects
 !README.md
 
 # Top-level config
@@ -643,7 +1038,13 @@ print_init_next_steps() {
     local target="$1" include_remote="${2:-true}"
     echo ""
     echo "Next steps:"
-    echo "  1. Add to your shell profile (e.g. ~/.zshrc):"
+    echo "  1. Install the managed shell env block:"
+    printf '       '
+    [ "$BACKEND" != "git" ] && printf 'CLAUDE_SYNC_BACKEND="%s" ' "$BACKEND"
+    [ -n "$STORAGE_URI" ] && printf 'CLAUDE_SYNC_STORAGE_URI="%s" ' "$STORAGE_URI"
+    [ -n "$WORKDIR" ] && printf 'CLAUDE_SYNC_WORKDIR="%s" ' "$WORKDIR"
+    printf 'CLAUDE_SYNC_DIR="%s" claude-sync env install\n' "$target"
+    echo "     Or add manually to your shell profile:"
     echo "       export CLAUDE_SYNC_DIR=\"$target\""
     [ "$BACKEND" != "git" ] && echo "       export CLAUDE_SYNC_BACKEND=\"$BACKEND\""
     [ -n "$STORAGE_URI" ] && echo "       export CLAUDE_SYNC_STORAGE_URI=\"$STORAGE_URI\""
@@ -745,6 +1146,11 @@ Commands:
   push         push local data to the configured backend
   pull         pull backend data + link
   link         set up / refresh symlinks
+  match        preview, apply, or set project mappings
+               (--dry-run to preview, --auto to apply suggestions,
+                LOCAL:CANONICAL for an explicit mapping)
+  agents       install/remove/status managed agent instructions
+  env          install/remove/status/print managed shell env block
   unlink       remove data-directory-owned symlinks
   clean        remove broken symlinks from ~/.claude/projects
   status       show data directory, backend, projects, link health, and changes
@@ -791,6 +1197,15 @@ REPO_DIR="$(resolve_repo_dir)"
 case "$ACTION" in
     link)
         do_link
+        ;;
+    match)
+        do_match
+        ;;
+    agents)
+        do_agents "${ARG1:-status}"
+        ;;
+    env)
+        do_env "${ARG1:-status}"
         ;;
     unlink|uninstall)
         do_unlink
@@ -864,6 +1279,17 @@ case "$ACTION" in
             echo "  $proj"
         done
         echo ""
+
+        if [ -f "$REPO_DIR/.claude-sync-projects" ]; then
+            echo "Project mappings:"
+            while IFS= read -r line || [ -n "$line" ]; do
+                case "$line" in
+                    ""|\#*) continue ;;
+                esac
+                echo "  $line"
+            done < "$REPO_DIR/.claude-sync-projects"
+            echo ""
+        fi
 
         if [ -d "$REPO_DIR/skills" ]; then
             skill_list=""
@@ -951,7 +1377,7 @@ case "$ACTION" in
                             echo "  [$proj]"
                             shown_projects="$shown_projects $proj"
                         fi
-                        echo "    ${line:0:2} ${file#projects/$proj/}"
+                        echo "    ${line:0:2} ${file#projects/"$proj"/}"
                         matched=true
                         break
                     fi

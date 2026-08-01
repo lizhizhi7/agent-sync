@@ -9,7 +9,7 @@
 # Override any of these via env vars (CLAUDE_SYNC_REPO, CLAUDE_SYNC_INSTALL_DIR,
 # CLAUDE_SYNC_BIN_DIR). Re-run to upgrade.
 
-set -e
+set -eu
 
 REPO="${CLAUDE_SYNC_REPO:-https://github.com/lizhizhi7/claude-sync.git}"
 INSTALL_DIR="${CLAUDE_SYNC_INSTALL_DIR:-$HOME/.local/share/claude-sync}"
