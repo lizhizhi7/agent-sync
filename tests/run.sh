@@ -272,7 +272,10 @@ test_mcp_server_links_preserve_venv_and_prune_stale() {
 
     assert_symlink_to "$target/server.py" "$data/mcp-servers/server/server.py"
     assert_symlink_to "$target/.env" "$data/mcp-servers/server/.env"
-    [ -d "$target/.venv" ] && [ ! -L "$target/.venv" ] || { echo ".venv was not preserved as a real dir" >&2; exit 1; }
+    if [ ! -d "$target/.venv" ] || [ -L "$target/.venv" ]; then
+        echo ".venv was not preserved as a real dir" >&2
+        exit 1
+    fi
     assert_file "$target/.venv/bin/python"
 
     rm "$data/mcp-servers/server/server.py"
