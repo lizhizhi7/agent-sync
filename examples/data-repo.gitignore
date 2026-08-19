@@ -1,17 +1,17 @@
-# claude-sync data directory — allowlist style.
+# agent-sync data directory — allowlist style.
 # Drop this in the root of your private data directory as `.gitignore`.
 # Ignore everything by default, then re-enable what should sync.
 
 *
 
 !.gitignore
-!.claude-sync-data
-!.claude-sync-projects
+!.agent-sync-data
+!.agent-sync-projects
 !README.md
 
 # Top-level config
 !settings.json
-!CLAUDE.md
+!instructions.md
 !keybindings.json
 
 # Custom skills

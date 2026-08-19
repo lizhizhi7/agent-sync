@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# claude-sync installer.
+# agent-sync installer.
 #
 # Defaults:
-#   tool repo : https://github.com/lizhizhi7/claude-sync.git
-#   install   : ~/.local/share/claude-sync
-#   bin       : ~/.local/bin/claude-sync
+#   tool repo : https://github.com/lizhizhi7/agent-sync.git
+#   install   : ~/.local/share/agent-sync
+#   bin       : ~/.local/bin/agent-sync
 #
-# Override any of these via env vars (CLAUDE_SYNC_REPO, CLAUDE_SYNC_INSTALL_DIR,
-# CLAUDE_SYNC_BIN_DIR). Re-run to upgrade.
+# Override any of these via env vars (AGENT_SYNC_REPO, AGENT_SYNC_INSTALL_DIR,
+# AGENT_SYNC_BIN_DIR). Re-run to upgrade.
 
 set -eu
 
-REPO="${CLAUDE_SYNC_REPO:-https://github.com/lizhizhi7/claude-sync.git}"
-INSTALL_DIR="${CLAUDE_SYNC_INSTALL_DIR:-$HOME/.local/share/claude-sync}"
-BIN_DIR="${CLAUDE_SYNC_BIN_DIR:-$HOME/.local/bin}"
+REPO="${AGENT_SYNC_REPO:-https://github.com/lizhizhi7/agent-sync.git}"
+INSTALL_DIR="${AGENT_SYNC_INSTALL_DIR:-$HOME/.local/share/agent-sync}"
+BIN_DIR="${AGENT_SYNC_BIN_DIR:-$HOME/.local/bin}"
 
 if [ -d "$INSTALL_DIR/.git" ]; then
     echo "Updating $INSTALL_DIR ..."
@@ -24,14 +24,14 @@ else
     git clone "$REPO" "$INSTALL_DIR"
 fi
 
-chmod +x "$INSTALL_DIR/bin/claude-sync"
+chmod +x "$INSTALL_DIR/bin/agent-sync"
 mkdir -p "$BIN_DIR"
-ln -sfn "$INSTALL_DIR/bin/claude-sync" "$BIN_DIR/claude-sync"
+ln -sfn "$INSTALL_DIR/bin/agent-sync" "$BIN_DIR/agent-sync"
 
 echo ""
 echo "Installed:"
 echo "  tool : $INSTALL_DIR"
-echo "  bin  : $BIN_DIR/claude-sync"
+echo "  bin  : $BIN_DIR/agent-sync"
 echo ""
 
 case ":$PATH:" in
@@ -45,6 +45,6 @@ case ":$PATH:" in
 esac
 
 echo "Next:"
-echo "  claude-sync init ~/path/to/your/private/config"
-echo "  export CLAUDE_SYNC_DIR=~/path/to/your/private/config"
-echo "  claude-sync link"
+echo "  agent-sync init ~/path/to/your/private/config"
+echo "  export AGENT_SYNC_DIR=~/path/to/your/private/config"
+echo "  agent-sync link"

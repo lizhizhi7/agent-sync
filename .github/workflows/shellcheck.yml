@@ -12,6 +12,6 @@ jobs:
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Lint
-        run: shellcheck bin/claude-sync install.sh tests/run.sh
+        run: shellcheck bin/agent-sync install.sh tests/run.sh
       - name: Tests
         run: tests/run.sh

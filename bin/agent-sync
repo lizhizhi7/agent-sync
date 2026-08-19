@@ -1,30 +1,126 @@
 #!/usr/bin/env bash
-# claude-sync — sync Claude Code config and project memory across devices.
+# agent-sync — sync coding-agent config and project memory across devices.
 #
 # Tool and data are decoupled:
 #   • This script is the tool. Install it once per machine.
 #   • Your config lives in a private local data directory.
-#     Point CLAUDE_SYNC_DIR at it, then choose a sync backend.
+#     Point AGENT_SYNC_DIR at it, then choose a sync backend.
 #
-# https://github.com/lizhizhi7/claude-sync
+# One data directory feeds several agents (Claude Code, tclaude, Codex).
+# Each agent declares where its home is and which assets it accepts;
+# see the "agent registry" section.
+#
+# https://github.com/lizhizhi7/agent-sync
 
 set -euo pipefail
 
-CLAUDE_DIR="$HOME/.claude"
-REMOTE="${CLAUDE_SYNC_REMOTE:-origin}"
-BACKEND="${CLAUDE_SYNC_BACKEND:-git}"
-STORAGE_URI="${CLAUDE_SYNC_STORAGE_URI:-}"
-STORAGE_OBJECT="${CLAUDE_SYNC_STORAGE_OBJECT:-claude-sync-data.tar.gz}"
+KNOWN_AGENTS="claude tclaude codex"
+DEFAULT_AGENTS="claude"
+
+REMOTE="${AGENT_SYNC_REMOTE:-origin}"
+BACKEND="${AGENT_SYNC_BACKEND:-git}"
+STORAGE_URI="${AGENT_SYNC_STORAGE_URI:-}"
+STORAGE_OBJECT="${AGENT_SYNC_STORAGE_OBJECT:-agent-sync-data.tar.gz}"
 BACKUP_STAMP="$(date '+%Y%m%d-%H%M%S')"
-BACKUP_DIR="$CLAUDE_DIR/backups/claude-sync-$BACKUP_STAMP"
-ENV_BLOCK_START="# >>> claude-sync >>>"
-ENV_BLOCK_END="# <<< claude-sync <<<"
-AGENT_BLOCK_START="<!-- >>> claude-sync:auto-sync >>> -->"
-AGENT_BLOCK_END="<!-- <<< claude-sync:auto-sync <<< -->"
+ENV_BLOCK_START="# >>> agent-sync >>>"
+ENV_BLOCK_END="# <<< agent-sync <<<"
+AGENT_BLOCK_START="<!-- >>> agent-sync:auto-sync >>> -->"
+AGENT_BLOCK_END="<!-- <<< agent-sync:auto-sync <<< -->"
+
+# Per-agent context, set by set_agent_context() before any linking work.
+AGENT_NAME=""
+AGENT_HOME=""
+BACKUP_DIR=""
 
 die() {
     echo "ERROR: $*" >&2
     exit 1
+}
+
+# ---------- agent registry ----------
+
+# Home directory each agent reads its configuration from.
+agent_home() {
+    case "$1" in
+        claude)  printf '%s\n' "$HOME/.claude" ;;
+        tclaude) printf '%s\n' "$HOME/.tclaude" ;;
+        codex)   printf '%s\n' "$HOME/.codex" ;;
+        *)       die "unknown agent '$1' (known: $KNOWN_AGENTS)" ;;
+    esac
+}
+
+# Where an asset lives inside the data directory.
+asset_source() {
+    case "$1" in
+        instructions) printf '%s\n' "$REPO_DIR/instructions.md" ;;
+        settings)     printf '%s\n' "$REPO_DIR/settings.json" ;;
+        keybindings)  printf '%s\n' "$REPO_DIR/keybindings.json" ;;
+        skills)       printf '%s\n' "$REPO_DIR/skills" ;;
+        mcp-servers)  printf '%s\n' "$REPO_DIR/mcp-servers" ;;
+        projects)     printf '%s\n' "$REPO_DIR/projects" ;;
+        *)            die "unknown asset '$1'" ;;
+    esac
+}
+
+# Where an asset lands inside an agent's home, relative to that home.
+# Empty output means the agent has no equivalent and the asset is skipped.
+#
+# Codex is deliberately partial: its settings are TOML (config.toml), it
+# registers MCP servers inside that file rather than as a directory, and it
+# has no per-project memory store. Only what genuinely maps is mapped.
+agent_asset() {
+    case "$1:$2" in
+        claude:instructions|tclaude:instructions)  printf '%s\n' "CLAUDE.md" ;;
+        codex:instructions)                        printf '%s\n' "AGENTS.md" ;;
+        claude:settings|tclaude:settings)          printf '%s\n' "settings.json" ;;
+        claude:keybindings|tclaude:keybindings)    printf '%s\n' "keybindings.json" ;;
+        claude:skills|tclaude:skills|codex:skills) printf '%s\n' "skills" ;;
+        claude:mcp-servers|tclaude:mcp-servers)    printf '%s\n' "mcp-servers" ;;
+        claude:projects|tclaude:projects)          printf '%s\n' "projects" ;;
+        *)                                         printf '%s\n' "" ;;
+    esac
+}
+
+agent_detected() {
+    case "$1" in
+        claude)  command_exists claude  || [ -d "$HOME/.claude" ] ;;
+        tclaude) command_exists tclaude || [ -d "$HOME/.tclaude" ] ;;
+        codex)   command_exists codex   || [ -d "$HOME/.codex" ] ;;
+        *)       return 1 ;;
+    esac
+}
+
+enabled_agents() {
+    local item
+    for item in $(printf '%s' "$AGENTS_ENABLED" | tr ',' ' '); do
+        printf '%s\n' "$item"
+    done
+}
+
+# Validate up front, in the main shell: enabled_agents() is consumed through
+# process substitution, where a die() would only kill the subshell.
+validate_agents() {
+    local item found=false
+    for item in $(printf '%s' "$AGENTS_ENABLED" | tr ',' ' '); do
+        agent_home "$item" >/dev/null
+        found=true
+    done
+    [ "$found" = true ] || die "no agents enabled (set AGENT_SYNC_AGENTS or pass -a)"
+}
+
+# Enabled agents that accept the given asset.
+agents_with_asset() {
+    local asset="$1" agent
+    while IFS= read -r agent; do
+        [ -n "$(agent_asset "$agent" "$asset")" ] && printf '%s\n' "$agent"
+    done < <(enabled_agents)
+    return 0
+}
+
+set_agent_context() {
+    AGENT_NAME="$1"
+    AGENT_HOME="$(agent_home "$1")"
+    BACKUP_DIR="$AGENT_HOME/backups/agent-sync-$BACKUP_STAMP"
 }
 
 # ---------- arg parsing ----------
@@ -32,6 +128,7 @@ die() {
 PREFIX=""
 WORKDIR=""
 WORKDIR_SET=false
+AGENTS_ENABLED=""
 ARGS=()
 UNLINK_ENV=false
 while [[ $# -gt 0 ]]; do
@@ -47,6 +144,11 @@ while [[ $# -gt 0 ]]; do
             WORKDIR_SET=true
             shift 2
             ;;
+        -a|--agents)
+            [ $# -ge 2 ] || die "$1 requires a value"
+            AGENTS_ENABLED="$2"
+            shift 2
+            ;;
         -h|--help)    ARGS+=("help"); shift ;;
         --env)        UNLINK_ENV=true; shift ;;
         *)            ARGS+=("$1"); shift ;;
@@ -55,37 +157,42 @@ done
 ACTION="${ARGS[0]:-sync}"
 ARG1="${ARGS[1]:-}"
 
-[ "$WORKDIR_SET" = false ] && [ -n "${CLAUDE_SYNC_WORKDIR:-}" ] && WORKDIR="$CLAUDE_SYNC_WORKDIR"
+[ "$WORKDIR_SET" = false ] && [ -n "${AGENT_SYNC_WORKDIR:-}" ] && WORKDIR="$AGENT_SYNC_WORKDIR"
+[ -z "$AGENTS_ENABLED" ] && AGENTS_ENABLED="${AGENT_SYNC_AGENTS:-$DEFAULT_AGENTS}"
 [ -z "$PREFIX" ] && PREFIX="$(echo "$HOME" | tr '/' '-')"
 [ -n "$WORKDIR" ] && PREFIX="${PREFIX}-$(echo "$WORKDIR" | tr '/' '-')"
+[ "$ACTION" = "help" ] || validate_agents
 
 # ---------- data directory resolution ----------
 
 resolve_repo_dir() {
-    if [ -z "${CLAUDE_SYNC_DIR:-}" ]; then
-        echo "ERROR: CLAUDE_SYNC_DIR is not set." >&2
+    if [ -z "${AGENT_SYNC_DIR:-}" ]; then
+        echo "ERROR: AGENT_SYNC_DIR is not set." >&2
         echo "" >&2
         echo "  Point it at your private data directory:" >&2
-        echo "    export CLAUDE_SYNC_DIR=\"\$HOME/path/to/your/config\"" >&2
+        echo "    export AGENT_SYNC_DIR=\"\$HOME/path/to/your/config\"" >&2
         echo "" >&2
         echo "  Or initialize a new one:" >&2
-        echo "    claude-sync init ~/path/to/your/config" >&2
+        echo "    agent-sync init ~/path/to/your/config" >&2
         exit 1
     fi
-    if [ ! -d "$CLAUDE_SYNC_DIR" ]; then
-        echo "ERROR: CLAUDE_SYNC_DIR=$CLAUDE_SYNC_DIR does not exist." >&2
+    if [ ! -d "$AGENT_SYNC_DIR" ]; then
+        echo "ERROR: AGENT_SYNC_DIR=$AGENT_SYNC_DIR does not exist." >&2
         exit 1
     fi
-    local dir
-    dir="$(cd "$CLAUDE_SYNC_DIR" && pwd -P)"
-    if [ "$dir" = "$CLAUDE_DIR" ] || [[ "$dir" == "$CLAUDE_DIR"/* ]]; then
-        echo "ERROR: CLAUDE_SYNC_DIR must not be inside $CLAUDE_DIR." >&2
-        exit 1
-    fi
-    if [ ! -e "$dir/.claude-sync-data" ]; then
-        echo "ERROR: $dir is not marked as a claude-sync data directory." >&2
-        echo "  Run: claude-sync init \"$dir\"" >&2
-        echo "  Or, if you know this directory is safe: touch \"$dir/.claude-sync-data\"" >&2
+    local dir home agent
+    dir="$(cd "$AGENT_SYNC_DIR" && pwd -P)"
+    for agent in $KNOWN_AGENTS; do
+        home="$(agent_home "$agent")"
+        if [ "$dir" = "$home" ] || [[ "$dir" == "$home"/* ]]; then
+            echo "ERROR: AGENT_SYNC_DIR must not be inside $home." >&2
+            exit 1
+        fi
+    done
+    if [ ! -e "$dir/.agent-sync-data" ]; then
+        echo "ERROR: $dir is not marked as an agent-sync data directory." >&2
+        echo "  Run: agent-sync init \"$dir\"" >&2
+        echo "  Or, if you know this directory is safe: touch \"$dir/.agent-sync-data\"" >&2
         exit 1
     fi
     printf '%s\n' "$dir"
@@ -108,7 +215,7 @@ is_repo_target() {
 backup_path() {
     local path="$1" rel dest
     [ -e "$path" ] || [ -L "$path" ] || return 0
-    rel="${path#"$CLAUDE_DIR"/}"
+    rel="${path#"$AGENT_HOME"/}"
     dest="$BACKUP_DIR/$rel"
     mkdir -p "$(dirname "$dest")"
     mv "$path" "$dest"
@@ -212,17 +319,31 @@ git_pull_rebase() {
 }
 
 storage_object_uri() {
-    [ -n "$STORAGE_URI" ] || die "CLAUDE_SYNC_STORAGE_URI is required for backend '$BACKEND'."
+    [ -n "$STORAGE_URI" ] || die "AGENT_SYNC_STORAGE_URI is required for backend '$BACKEND'."
     printf '%s/%s\n' "${STORAGE_URI%/}" "$STORAGE_OBJECT"
+}
+
+synced_data_paths() {
+    printf '%s\n' \
+        .gitignore \
+        .agent-sync-data \
+        .agent-sync-projects \
+        README.md \
+        settings.json \
+        instructions.md \
+        keybindings.json \
+        skills \
+        mcp-servers \
+        projects
 }
 
 create_storage_archive() {
     local archive="$1" stage path
     stage="$(mktemp -d)"
-    for path in .gitignore .claude-sync-data .claude-sync-projects README.md settings.json CLAUDE.md keybindings.json skills mcp-servers projects; do
+    while IFS= read -r path; do
         [ -e "$REPO_DIR/$path" ] || continue
         cp -pR "$REPO_DIR/$path" "$stage/$path"
-    done
+    done < <(synced_data_paths)
     if [ -d "$stage/mcp-servers" ]; then
         find "$stage/mcp-servers" -path '*/.venv' -type d -prune -exec rm -rf {} +
     fi
@@ -264,17 +385,13 @@ extract_storage_archive() {
 
 clear_synced_data_paths() {
     local path
-    for path in \
-        "$REPO_DIR/settings.json" \
-        "$REPO_DIR/keybindings.json" \
-        "$REPO_DIR/CLAUDE.md" \
-        "$REPO_DIR/.claude-sync-projects" \
-        "$REPO_DIR/skills" \
-        "$REPO_DIR/mcp-servers" \
-        "$REPO_DIR/projects"; do
-        [ -e "$path" ] || [ -L "$path" ] || continue
-        rm -rf "$path"
-    done
+    while IFS= read -r path; do
+        [ -e "$REPO_DIR/$path" ] || [ -L "$REPO_DIR/$path" ] || continue
+        case "$path" in
+            .gitignore|.agent-sync-data|README.md) continue ;;
+        esac
+        rm -rf "${REPO_DIR:?}/$path"
+    done < <(synced_data_paths)
 }
 
 backend_require() {
@@ -295,20 +412,20 @@ backend_require() {
             command_exists aws || die "AWS CLI is required for backend 's3'."
             case "$(storage_object_uri)" in
                 s3://*) : ;;
-                *) die "CLAUDE_SYNC_STORAGE_URI must start with s3:// for backend 's3'." ;;
+                *) die "AGENT_SYNC_STORAGE_URI must start with s3:// for backend 's3'." ;;
             esac
             ;;
         gcs)
             command_exists gcloud || die "gcloud CLI is required for backend 'gcs'."
             case "$(storage_object_uri)" in
                 gs://*) : ;;
-                *) die "CLAUDE_SYNC_STORAGE_URI must start with gs:// for backend 'gcs'." ;;
+                *) die "AGENT_SYNC_STORAGE_URI must start with gs:// for backend 'gcs'." ;;
             esac
             ;;
         local)
             ;;
         *)
-            die "unknown CLAUDE_SYNC_BACKEND '$BACKEND' (expected git, s3, gcs, or local)."
+            die "unknown AGENT_SYNC_BACKEND '$BACKEND' (expected git, s3, gcs, or local)."
             ;;
     esac
 }
@@ -419,7 +536,7 @@ canonical_for_device_project() {
 
 project_mapping_lookup() {
     local local_name="$1" map_file line lhs rhs
-    map_file="$REPO_DIR/.claude-sync-projects"
+    map_file="$REPO_DIR/.agent-sync-projects"
     [ -f "$map_file" ] || return 0
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in
@@ -438,7 +555,7 @@ write_project_mapping() {
     local local_name="$1" canonical="$2" map_file tmp line lhs
     validate_project_name "$local_name"
     validate_project_name "$canonical"
-    map_file="$REPO_DIR/.claude-sync-projects"
+    map_file="$REPO_DIR/.agent-sync-projects"
     tmp="$(mktemp)"
     if [ -f "$map_file" ]; then
         while IFS= read -r line || [ -n "$line" ]; do
@@ -454,71 +571,118 @@ write_project_mapping() {
     mv "$tmp" "$map_file"
 }
 
+# Map one device-local project name onto a canonical one, for every enabled
+# agent that keeps per-project memory. The mapping file itself is shared:
+# Claude Code and tclaude use the identical path-derived naming scheme.
 apply_project_mapping() {
-    local local_name="$1" canonical="$2" local_mem canonical_mem
+    local local_name="$1" canonical="$2" agent local_mem canonical_mem
     validate_project_name "$local_name"
     validate_project_name "$canonical"
-    local_mem="$CLAUDE_DIR/projects/$local_name/memory"
     canonical_mem="$REPO_DIR/projects/$canonical/memory"
     mkdir -p "$canonical_mem"
-    if [ -d "$local_mem" ] && [ ! -L "$local_mem" ]; then
-        copy_tree_no_clobber "$local_mem" "$canonical_mem"
-    fi
+    while IFS= read -r agent; do
+        set_agent_context "$agent"
+        local_mem="$AGENT_HOME/projects/$local_name/memory"
+        if [ -d "$local_mem" ] && [ ! -L "$local_mem" ]; then
+            copy_tree_no_clobber "$local_mem" "$canonical_mem"
+        fi
+        make_link "$canonical_mem" "$local_mem"
+        echo "  mapped $local_name -> $canonical ($agent)"
+    done < <(agents_with_asset projects)
     write_project_mapping "$local_name" "$canonical"
-    make_link "$canonical_mem" "$local_mem"
-    echo "  mapped $local_name -> $canonical"
 }
 
-link_configs() {
-    mkdir -p "$CLAUDE_DIR"
-    local f
-    for f in settings.json keybindings.json CLAUDE.md; do
-        if [ -f "$REPO_DIR/$f" ]; then
-            make_link "$REPO_DIR/$f" "$CLAUDE_DIR/$f"
-            echo "  linked $f"
+# Link each direct child of src_dir into dest_dir as its own symlink. Entries
+# the data directory does not own (vendor-shipped skills, a device-local
+# .venv) are left in place; links to entries that have since been removed from
+# the data directory are pruned.
+link_children() {
+    local src_dir="$1" dest_dir="$2" exclude="${3:-}"
+    local inner inner_name dest
+    # A whole-directory symlink (from an older layout) would shadow the
+    # per-entry links; replace it with a real directory.
+    if [ -L "$dest_dir" ]; then
+        rm -f "$dest_dir"
+    fi
+    mkdir -p "$dest_dir"
+    for inner in "$src_dir"/* "$src_dir"/.[!.]* "$src_dir"/..?*; do
+        [ -e "$inner" ] || [ -L "$inner" ] || continue
+        inner_name="$(basename "$inner")"
+        if [ -n "$exclude" ] && [ "$inner_name" = "$exclude" ]; then
+            continue
+        fi
+        make_link "$inner" "$dest_dir/$inner_name"
+    done
+    for inner in "$dest_dir"/* "$dest_dir"/.[!.]* "$dest_dir"/..?*; do
+        [ -L "$inner" ] || continue
+        dest="$(readlink "$inner")"
+        if is_repo_target "$dest" && [ ! -e "$inner" ]; then
+            rm -f "$inner"
         fi
     done
-    if [ -d "$REPO_DIR/skills" ]; then
-        make_link "$REPO_DIR/skills" "$CLAUDE_DIR/skills"
+}
+
+# Remove only the links dest_dir holds into the data directory, then drop the
+# directory itself if nothing device-local is left. Prints how many it removed.
+unlink_children() {
+    local dest_dir="$1" inner dest n=0
+    [ -d "$dest_dir" ] || { printf '0\n'; return 0; }
+    for inner in "$dest_dir"/* "$dest_dir"/.[!.]* "$dest_dir"/..?*; do
+        [ -L "$inner" ] || continue
+        dest="$(readlink "$inner")"
+        if is_repo_target "$dest"; then
+            rm -f "$inner"
+            n=$((n + 1))
+        fi
+    done
+    rmdir "$dest_dir" 2>/dev/null || true
+    printf '%s\n' "$n"
+}
+
+link_agent_configs() {
+    local asset rel src
+    mkdir -p "$AGENT_HOME"
+    for asset in instructions settings keybindings; do
+        rel="$(agent_asset "$AGENT_NAME" "$asset")"
+        [ -n "$rel" ] || continue
+        src="$(asset_source "$asset")"
+        [ -f "$src" ] || continue
+        make_link "$src" "$AGENT_HOME/$rel"
+        echo "  linked $rel"
+    done
+
+    rel="$(agent_asset "$AGENT_NAME" skills)"
+    src="$(asset_source skills)"
+    if [ -n "$rel" ] && [ -d "$src" ]; then
+        # Per-skill links, not a directory symlink: agents ship their own
+        # skills into this directory (Codex has skills/.system/) and a
+        # whole-directory link would hide them.
+        link_children "$src" "$AGENT_HOME/$rel"
         echo "  linked skills/"
     fi
-    if [ -d "$REPO_DIR/mcp-servers" ]; then
-        mkdir -p "$CLAUDE_DIR/mcp-servers"
-        local srv_dir srv_name target inner inner_name dest
-        for srv_dir in "$REPO_DIR"/mcp-servers/*/; do
+
+    rel="$(agent_asset "$AGENT_NAME" mcp-servers)"
+    src="$(asset_source mcp-servers)"
+    if [ -n "$rel" ] && [ -d "$src" ]; then
+        mkdir -p "$AGENT_HOME/$rel"
+        local srv_dir srv_name
+        for srv_dir in "$src"/*/; do
             [ ! -d "$srv_dir" ] && continue
             srv_name="$(basename "$srv_dir")"
-            target="$CLAUDE_DIR/mcp-servers/$srv_name"
-            # A whole-directory symlink (from an older layout) would shadow
-            # the per-file links; replace it with a real directory.
-            if [ -L "$target" ]; then
-                rm -f "$target"
-            fi
-            mkdir -p "$target"
-            for inner in "$srv_dir"* "$srv_dir".[!.]* "$srv_dir"..?*; do
-                [ -e "$inner" ] || [ -L "$inner" ] || continue
-                inner_name="$(basename "$inner")"
-                [ "$inner_name" = ".venv" ] && continue
-                make_link "$inner" "$target/$inner_name"
-            done
-            # Prune stale links to files removed from the data directory,
-            # leaving device-local entries (like .venv) alone.
-            for inner in "$target"/* "$target"/.[!.]* "$target"/..?*; do
-                [ -L "$inner" ] || continue
-                dest="$(readlink "$inner")"
-                if is_repo_target "$dest" && [ ! -e "$inner" ]; then
-                    rm -f "$inner"
-                fi
-            done
+            # .venv stays device-local so each machine keeps its own venv.
+            link_children "${srv_dir%/}" "$AGENT_HOME/$rel/$srv_name" .venv
             echo "  linked mcp-server: $srv_name"
         done
     fi
+    return 0
 }
 
-link_projects() {
-    mkdir -p "$CLAUDE_DIR/projects"
-    local count=0 canonical_mem canonical device_name map_file line local_name mapped
-    map_file="$REPO_DIR/.claude-sync-projects"
+link_agent_projects() {
+    local rel count=0 canonical_mem canonical device_name map_file line local_name mapped
+    rel="$(agent_asset "$AGENT_NAME" projects)"
+    [ -n "$rel" ] || return 0
+    mkdir -p "$AGENT_HOME/$rel"
+    map_file="$REPO_DIR/.agent-sync-projects"
     if [ -f "$map_file" ]; then
         while IFS= read -r line || [ -n "$line" ]; do
             case "$line" in
@@ -530,8 +694,8 @@ link_projects() {
             [ -n "$mapped" ] || continue
             validate_project_name "$local_name"
             validate_project_name "$mapped"
-            mkdir -p "$REPO_DIR/projects/$mapped/memory" "$CLAUDE_DIR/projects/$local_name"
-            make_link "$REPO_DIR/projects/$mapped/memory" "$CLAUDE_DIR/projects/$local_name/memory"
+            mkdir -p "$REPO_DIR/projects/$mapped/memory" "$AGENT_HOME/$rel/$local_name"
+            make_link "$REPO_DIR/projects/$mapped/memory" "$AGENT_HOME/$rel/$local_name/memory"
             count=$((count + 1))
         done < "$map_file"
     fi
@@ -539,16 +703,16 @@ link_projects() {
         [ ! -d "$canonical_mem" ] && continue
         canonical="$(basename "$(dirname "$canonical_mem")")"
 
-        mkdir -p "$CLAUDE_DIR/projects/$canonical"
-        make_link "$canonical_mem" "$CLAUDE_DIR/projects/$canonical/memory"
+        mkdir -p "$AGENT_HOME/$rel/$canonical"
+        make_link "$canonical_mem" "$AGENT_HOME/$rel/$canonical/memory"
 
         if [ "$canonical" = "_home" ]; then
             device_name="$PREFIX"
         else
             device_name="${PREFIX}${canonical}"
         fi
-        mkdir -p "$CLAUDE_DIR/projects/$device_name"
-        make_link "$canonical_mem" "$CLAUDE_DIR/projects/$device_name/memory"
+        mkdir -p "$AGENT_HOME/$rel/$device_name"
+        make_link "$canonical_mem" "$AGENT_HOME/$rel/$device_name/memory"
 
         count=$((count + 1))
     done
@@ -556,10 +720,12 @@ link_projects() {
     return 0
 }
 
-migrate_local_memory() {
-    [ ! -d "$CLAUDE_DIR/projects" ] && return 0
-    local count=0 device_mem device_dir canonical
-    for device_mem in "$CLAUDE_DIR/projects/${PREFIX}"-*/memory; do
+migrate_agent_memory() {
+    local rel count=0 device_mem device_dir canonical
+    rel="$(agent_asset "$AGENT_NAME" projects)"
+    [ -n "$rel" ] || return 0
+    [ ! -d "$AGENT_HOME/$rel" ] && return 0
+    for device_mem in "$AGENT_HOME/$rel/${PREFIX}"-*/memory; do
         [ ! -d "$device_mem" ] && continue
         [ -L "$device_mem" ] && continue
         device_dir="$(basename "$(dirname "$device_mem")")"
@@ -568,20 +734,31 @@ migrate_local_memory() {
         copy_tree_no_clobber "$device_mem" "$REPO_DIR/projects/$canonical/memory"
         count=$((count + 1))
     done
-    if [ -d "$CLAUDE_DIR/projects/$PREFIX/memory" ] \
-       && [ ! -L "$CLAUDE_DIR/projects/$PREFIX/memory" ]; then
+    if [ -d "$AGENT_HOME/$rel/$PREFIX/memory" ] \
+       && [ ! -L "$AGENT_HOME/$rel/$PREFIX/memory" ]; then
         mkdir -p "$REPO_DIR/projects/_home/memory"
-        copy_tree_no_clobber "$CLAUDE_DIR/projects/$PREFIX/memory" "$REPO_DIR/projects/_home/memory"
+        copy_tree_no_clobber "$AGENT_HOME/$rel/$PREFIX/memory" "$REPO_DIR/projects/_home/memory"
         count=$((count + 1))
     fi
-    [ "$count" -gt 0 ] && echo "  migrated memory from $count local project(s)"
+    [ "$count" -gt 0 ] && echo "  migrated memory from $count local project(s) ($AGENT_NAME)"
     return 0
 }
 
-clean_projects() {
-    [ ! -d "$CLAUDE_DIR/projects" ] && return 0
-    local count=0 mem_link proj_dir
-    for mem_link in "$CLAUDE_DIR"/projects/*/memory; do
+migrate_local_memory() {
+    local agent
+    while IFS= read -r agent; do
+        set_agent_context "$agent"
+        migrate_agent_memory
+    done < <(agents_with_asset projects)
+    return 0
+}
+
+clean_agent_projects() {
+    local rel count=0 mem_link proj_dir
+    rel="$(agent_asset "$AGENT_NAME" projects)"
+    [ -n "$rel" ] || return 0
+    [ ! -d "$AGENT_HOME/$rel" ] && return 0
+    for mem_link in "$AGENT_HOME/$rel"/*/memory; do
         [ ! -L "$mem_link" ] && continue
         if [ ! -e "$mem_link" ]; then
             proj_dir="$(dirname "$mem_link")"
@@ -590,60 +767,77 @@ clean_projects() {
             count=$((count + 1))
         fi
     done
-    [ "$count" -gt 0 ] && echo "  cleaned $count broken symlink(s)"
+    [ "$count" -gt 0 ] && echo "  cleaned $count broken symlink(s) ($AGENT_NAME)"
+    return 0
+}
+
+clean_projects() {
+    local agent
+    while IFS= read -r agent; do
+        set_agent_context "$agent"
+        clean_agent_projects
+    done < <(agents_with_asset projects)
     return 0
 }
 
 do_link() {
+    local agent
     echo "Linking $REPO_DIR (prefix: $PREFIX) ..."
     migrate_local_memory
-    clean_projects
-    link_configs
-    link_projects
+    while IFS= read -r agent; do
+        set_agent_context "$agent"
+        echo "$agent -> $AGENT_HOME"
+        clean_agent_projects
+        link_agent_configs
+        link_agent_projects
+    done < <(enabled_agents)
     echo "Done."
 }
 
-do_unlink() {
-    echo "Unlinking claude-sync from $CLAUDE_DIR ..."
-    local removed=0 dest f target srv_dir srv_name touched inner mem_link
-    for f in settings.json keybindings.json CLAUDE.md skills; do
-        target="$CLAUDE_DIR/$f"
+UNLINK_COUNT=0
+unlink_agent() {
+    local removed=0 n dest asset rel target srv_dir srv_name mem_link
+
+    for asset in instructions settings keybindings; do
+        rel="$(agent_asset "$AGENT_NAME" "$asset")"
+        [ -n "$rel" ] || continue
+        target="$AGENT_HOME/$rel"
         if [ -L "$target" ]; then
             dest="$(readlink "$target")"
             if is_repo_target "$dest"; then
                 rm -f "$target"
-                echo "  unlinked $f"
+                echo "  unlinked $rel"
                 removed=$((removed+1))
             fi
         fi
     done
-    if [ -d "$CLAUDE_DIR/mcp-servers" ]; then
-        for srv_dir in "$CLAUDE_DIR"/mcp-servers/*/; do
+
+    rel="$(agent_asset "$AGENT_NAME" skills)"
+    if [ -n "$rel" ]; then
+        n="$(unlink_children "$AGENT_HOME/$rel")"
+        if [ "$n" -gt 0 ]; then
+            echo "  unlinked $n skill(s)"
+            removed=$((removed + n))
+        fi
+    fi
+
+    rel="$(agent_asset "$AGENT_NAME" mcp-servers)"
+    if [ -n "$rel" ] && [ -d "$AGENT_HOME/$rel" ]; then
+        for srv_dir in "$AGENT_HOME/$rel"/*/; do
             [ ! -d "$srv_dir" ] && continue
             srv_name="$(basename "$srv_dir")"
-            touched=false
-            for inner in "$srv_dir"* "$srv_dir".[!.]* "$srv_dir"..?*; do
-                [ ! -e "$inner" ] && [ ! -L "$inner" ] && continue
-                if [ -L "$inner" ]; then
-                    dest="$(readlink "$inner")"
-                    if is_repo_target "$dest"; then
-                        rm -f "$inner"
-                        touched=true
-                    fi
-                fi
-            done
-            if [ -z "$(ls -A "$srv_dir" 2>/dev/null)" ]; then
-                rmdir "$srv_dir" 2>/dev/null || true
-            fi
-            if [ "$touched" = true ]; then
+            n="$(unlink_children "${srv_dir%/}")"
+            if [ "$n" -gt 0 ]; then
                 echo "  unlinked mcp-server: $srv_name"
-                removed=$((removed+1))
+                removed=$((removed + 1))
             fi
         done
-        rmdir "$CLAUDE_DIR/mcp-servers" 2>/dev/null || true
+        rmdir "$AGENT_HOME/$rel" 2>/dev/null || true
     fi
-    if [ -d "$CLAUDE_DIR/projects" ]; then
-        for mem_link in "$CLAUDE_DIR"/projects/*/memory; do
+
+    rel="$(agent_asset "$AGENT_NAME" projects)"
+    if [ -n "$rel" ] && [ -d "$AGENT_HOME/$rel" ]; then
+        for mem_link in "$AGENT_HOME/$rel"/*/memory; do
             [ ! -L "$mem_link" ] && continue
             dest="$(readlink "$mem_link")"
             if is_repo_target "$dest"; then
@@ -653,10 +847,23 @@ do_unlink() {
             fi
         done
     fi
-    if [ "$removed" -eq 0 ]; then
+
+    UNLINK_COUNT=$((UNLINK_COUNT + removed))
+}
+
+do_unlink() {
+    local agent
+    echo "Unlinking agent-sync ..."
+    UNLINK_COUNT=0
+    while IFS= read -r agent; do
+        set_agent_context "$agent"
+        echo "$agent -> $AGENT_HOME"
+        unlink_agent
+    done < <(enabled_agents)
+    if [ "$UNLINK_COUNT" -eq 0 ]; then
         echo "  nothing to unlink."
     else
-        echo "Unlinked $removed item(s). Data directory at $REPO_DIR is intact."
+        echo "Unlinked $UNLINK_COUNT item(s). Data directory at $REPO_DIR is intact."
     fi
     if [ "$UNLINK_ENV" = true ]; then
         do_env remove
@@ -665,13 +872,15 @@ do_unlink() {
 
 env_block_body() {
     local body
-    body="export CLAUDE_SYNC_DIR=$(shell_quote "$REPO_DIR")"
-    body="${body}"$'\n'"export CLAUDE_SYNC_BACKEND=$(shell_quote "$BACKEND")"
-    [ -n "$STORAGE_URI" ] && body="${body}"$'\n'"export CLAUDE_SYNC_STORAGE_URI=$(shell_quote "$STORAGE_URI")"
-    [ -n "$STORAGE_OBJECT" ] && [ "$STORAGE_OBJECT" != "claude-sync-data.tar.gz" ] \
-        && body="${body}"$'\n'"export CLAUDE_SYNC_STORAGE_OBJECT=$(shell_quote "$STORAGE_OBJECT")"
-    [ -n "$WORKDIR" ] && body="${body}"$'\n'"export CLAUDE_SYNC_WORKDIR=$(shell_quote "$WORKDIR")"
-    [ -n "$REMOTE" ] && [ "$REMOTE" != "origin" ] && body="${body}"$'\n'"export CLAUDE_SYNC_REMOTE=$(shell_quote "$REMOTE")"
+    body="export AGENT_SYNC_DIR=$(shell_quote "$REPO_DIR")"
+    body="${body}"$'\n'"export AGENT_SYNC_BACKEND=$(shell_quote "$BACKEND")"
+    [ "$AGENTS_ENABLED" != "$DEFAULT_AGENTS" ] \
+        && body="${body}"$'\n'"export AGENT_SYNC_AGENTS=$(shell_quote "$AGENTS_ENABLED")"
+    [ -n "$STORAGE_URI" ] && body="${body}"$'\n'"export AGENT_SYNC_STORAGE_URI=$(shell_quote "$STORAGE_URI")"
+    [ -n "$STORAGE_OBJECT" ] && [ "$STORAGE_OBJECT" != "agent-sync-data.tar.gz" ] \
+        && body="${body}"$'\n'"export AGENT_SYNC_STORAGE_OBJECT=$(shell_quote "$STORAGE_OBJECT")"
+    [ -n "$WORKDIR" ] && body="${body}"$'\n'"export AGENT_SYNC_WORKDIR=$(shell_quote "$WORKDIR")"
+    [ -n "$REMOTE" ] && [ "$REMOTE" != "origin" ] && body="${body}"$'\n'"export AGENT_SYNC_REMOTE=$(shell_quote "$REMOTE")"
     printf '%s\n' "$body"
 }
 
@@ -681,17 +890,17 @@ do_env() {
         install)
             profile="$(default_shell_profile)"
             write_managed_block "$profile" "$ENV_BLOCK_START" "$ENV_BLOCK_END" "$(env_block_body)"
-            echo "Installed claude-sync env block in $profile"
+            echo "Installed agent-sync env block in $profile"
             ;;
         remove|clean)
             while IFS= read -r profile; do
                 if managed_block_present "$profile" "$ENV_BLOCK_START"; then
                     remove_managed_block "$profile" "$ENV_BLOCK_START" "$ENV_BLOCK_END"
-                    echo "Removed claude-sync env block from $profile"
+                    echo "Removed agent-sync env block from $profile"
                     found=true
                 fi
             done < <(env_profiles)
-            [ "$found" = true ] || echo "No managed claude-sync env blocks found."
+            [ "$found" = true ] || echo "No managed agent-sync env blocks found."
             ;;
         status)
             while IFS= read -r profile; do
@@ -700,7 +909,7 @@ do_env() {
                     found=true
                 fi
             done < <(env_profiles)
-            [ "$found" = true ] || echo "No managed claude-sync env blocks found."
+            [ "$found" = true ] || echo "No managed agent-sync env blocks found."
             ;;
         print)
             printf '%s\n' "$ENV_BLOCK_START"
@@ -713,66 +922,81 @@ do_env() {
     esac
 }
 
+# ---------- managed agent instructions ----------
+
+# The instruction block lives in the shared instructions file, which is
+# symlinked into every enabled agent's home — one copy reaches all of them.
 agent_instruction_body() {
     cat <<'EOF'
-Use claude-sync for durable Claude Code configuration and memory changes on this machine:
+Use agent-sync for durable agent configuration and memory changes on this machine:
 
-- Run `claude-sync status` before changing synced config or project memory when context is unclear.
-- Run `claude-sync match` if a project appears under a new local project name.
-- Run `claude-sync sync` after changes that should be shared across devices.
-- Do not edit shell profiles, unlink synced files, or delete local Claude data unless the user asks.
+- Run `agent-sync status` before changing synced config or project memory when context is unclear.
+- Run `agent-sync match` if a project appears under a new local project name.
+- Run `agent-sync sync` after changes that should be shared across devices.
+- Do not edit shell profiles, unlink synced files, or delete local agent data unless the user asks.
 EOF
 }
 
-detect_agent_targets() {
-    if command_exists claude || [ -d "$CLAUDE_DIR" ] || [ -f "$REPO_DIR/CLAUDE.md" ]; then
-        printf '%s\t%s\n' "Claude Code" "$REPO_DIR/CLAUDE.md"
-    fi
-    if command_exists codex || [ -d "$HOME/.codex" ] || [ -f "$HOME/.codex/AGENTS.md" ]; then
-        printf '%s\t%s\n' "Codex" "$HOME/.codex/AGENTS.md"
-    fi
-}
-
-do_agents() {
-    local sub="${1:-status}" found=false name target
+do_instructions() {
+    local sub="${1:-status}" target
+    target="$(asset_source instructions)"
     case "$sub" in
         install)
-            while IFS=$'\t' read -r name target; do
-                [ -n "$name" ] || continue
-                write_managed_block "$target" "$AGENT_BLOCK_START" "$AGENT_BLOCK_END" "$(agent_instruction_body)"
-                echo "Installed claude-sync agent instruction for $name: $target"
-                found=true
-            done < <(detect_agent_targets)
-            [ "$found" = true ] || echo "No supported agent tools detected."
+            write_managed_block "$target" "$AGENT_BLOCK_START" "$AGENT_BLOCK_END" "$(agent_instruction_body)"
+            echo "Installed agent-sync instruction block in $target"
             ;;
         remove|clean)
-            while IFS=$'\t' read -r name target; do
-                [ -n "$name" ] || continue
-                if managed_block_present "$target" "$AGENT_BLOCK_START"; then
-                    remove_managed_block "$target" "$AGENT_BLOCK_START" "$AGENT_BLOCK_END"
-                    echo "Removed claude-sync agent instruction for $name: $target"
-                    found=true
-                fi
-            done < <(detect_agent_targets)
-            [ "$found" = true ] || echo "No managed claude-sync agent instructions found."
+            if managed_block_present "$target" "$AGENT_BLOCK_START"; then
+                remove_managed_block "$target" "$AGENT_BLOCK_START" "$AGENT_BLOCK_END"
+                echo "Removed agent-sync instruction block from $target"
+            else
+                echo "No managed agent-sync instruction block found in $target"
+            fi
             ;;
         status)
-            while IFS=$'\t' read -r name target; do
-                [ -n "$name" ] || continue
-                if managed_block_present "$target" "$AGENT_BLOCK_START"; then
-                    echo "$name: managed instruction installed at $target"
-                else
-                    echo "$name: detected, no managed instruction at $target"
-                fi
-                found=true
-            done < <(detect_agent_targets)
-            [ "$found" = true ] || echo "No supported agent tools detected."
+            if managed_block_present "$target" "$AGENT_BLOCK_START"; then
+                echo "managed instruction block: $target"
+            else
+                echo "no managed instruction block in $target"
+            fi
             ;;
         *)
-            die "unknown agents command '$sub' (expected install, remove, or status)"
+            die "unknown instructions command '$sub' (expected install, remove, or status)"
             ;;
     esac
 }
+
+do_agents() {
+    local agent state assets asset rel enabled
+    echo "Data: $REPO_DIR"
+    echo ""
+    printf '  %-9s %-9s %-24s %s\n' "AGENT" "STATE" "HOME" "SYNCED ASSETS"
+    for agent in $KNOWN_AGENTS; do
+        enabled=false
+        if printf '%s\n' "$AGENTS_ENABLED" | tr ',' '\n' | grep -Fqx "$agent"; then
+            enabled=true
+        fi
+        if [ "$enabled" = true ]; then
+            state="enabled"
+        elif agent_detected "$agent"; then
+            state="detected"
+        else
+            state="absent"
+        fi
+        assets=""
+        for asset in instructions settings keybindings skills mcp-servers projects; do
+            rel="$(agent_asset "$agent" "$asset")"
+            [ -n "$rel" ] && assets="$assets $asset"
+        done
+        printf '  %-9s %-9s %-24s %s\n' \
+            "$agent" "$state" "$(agent_home "$agent" | sed "s|^$HOME|~|")" "${assets# }"
+    done
+    echo ""
+    echo "Enable agents with AGENT_SYNC_AGENTS=\"claude,codex\" (or -a claude,codex),"
+    echo "then run \`agent-sync link\`."
+}
+
+# ---------- project matching ----------
 
 project_link_state() {
     local mem="$1" dest
@@ -801,7 +1025,7 @@ print_project_match_row() {
 
 do_match() {
     local dry_run=false auto=false explicit=false arg local_name canonical
-    local projects_dir="$CLAUDE_DIR/projects"
+    local agent projects_dir rel
     local mem device_dir state suggestion applied=0 seen=0
     local i=1
 
@@ -841,53 +1065,54 @@ do_match() {
     echo "Prefix: $PREFIX"
     echo ""
 
-    if [ ! -d "$projects_dir" ]; then
-        echo "No local Claude projects found."
-        return 0
-    fi
+    while IFS= read -r agent; do
+        set_agent_context "$agent"
+        rel="$(agent_asset "$agent" projects)"
+        projects_dir="$AGENT_HOME/$rel"
+        [ -d "$projects_dir" ] || continue
+        echo "$agent ($projects_dir):"
 
-    for mem in "$projects_dir"/*/memory; do
-        [ -e "$mem" ] || [ -L "$mem" ] || continue
-        device_dir="$(basename "$(dirname "$mem")")"
-        state="$(project_link_state "$mem")"
-        suggestion="$(canonical_for_device_project "$device_dir")"
-        seen=$((seen + 1))
+        for mem in "$projects_dir"/*/memory; do
+            [ -e "$mem" ] || [ -L "$mem" ] || continue
+            device_dir="$(basename "$(dirname "$mem")")"
+            state="$(project_link_state "$mem")"
+            suggestion="$(canonical_for_device_project "$device_dir")"
+            seen=$((seen + 1))
 
-        case "$state" in
-            linked)
-                print_project_match_row "$device_dir" "$state" "$suggestion"
-                ;;
-            local)
-                print_project_match_row "$device_dir" "$state" "$suggestion"
-                if [ "$dry_run" = true ]; then
-                    :
-                elif [ "$auto" = true ]; then
-                    apply_project_mapping "$device_dir" "$suggestion"
-                    applied=$((applied + 1))
-                elif [ -t 0 ] && [ -t 1 ]; then
-                    if prompt_yn "Map $device_dir to $suggestion?"; then
+            case "$state" in
+                local)
+                    print_project_match_row "$device_dir" "$state" "$suggestion"
+                    if [ "$dry_run" = true ]; then
+                        :
+                    elif [ "$auto" = true ]; then
                         apply_project_mapping "$device_dir" "$suggestion"
                         applied=$((applied + 1))
+                    elif [ -t 0 ] && [ -t 1 ]; then
+                        if prompt_yn "Map $device_dir to $suggestion?"; then
+                            apply_project_mapping "$device_dir" "$suggestion"
+                            applied=$((applied + 1))
+                        fi
                     fi
-                fi
-                ;;
-            broken|foreign)
-                print_project_match_row "$device_dir" "$state" "$suggestion"
-                ;;
-        esac
-    done
+                    ;;
+                *)
+                    print_project_match_row "$device_dir" "$state" "$suggestion"
+                    ;;
+            esac
+        done
+        echo ""
+    done < <(agents_with_asset projects)
 
     if [ "$seen" -eq 0 ]; then
-        echo "No local Claude project memory directories found."
+        echo "No local project memory directories found."
     elif [ "$dry_run" = true ]; then
-        echo ""
-        echo "Preview only. Use 'claude-sync match --auto' to apply suggestions,"
-        echo "or 'claude-sync match LOCAL:CANONICAL' for an explicit mapping."
+        echo "Preview only. Use 'agent-sync match --auto' to apply suggestions,"
+        echo "or 'agent-sync match LOCAL:CANONICAL' for an explicit mapping."
     elif [ "$applied" -gt 0 ]; then
-        echo ""
         echo "Applied $applied project mapping(s)."
     fi
 }
+
+# ---------- init ----------
 
 prompt_yn() {
     local q="$1" def="${2:-y}" hint reply
@@ -917,78 +1142,108 @@ prompt_path() {
     printf '%s' "$reply"
 }
 
-has_existing_claude_content() {
-    [ -d "$CLAUDE_DIR" ] || return 1
-    local f d
-    for f in settings.json CLAUDE.md keybindings.json; do
-        [ -f "$CLAUDE_DIR/$f" ] && [ ! -L "$CLAUDE_DIR/$f" ] && return 0
-    done
-    if [ -d "$CLAUDE_DIR/skills" ] && [ ! -L "$CLAUDE_DIR/skills" ]; then
-        [ -n "$(ls -A "$CLAUDE_DIR/skills" 2>/dev/null)" ] && return 0
-    fi
-    if [ -d "$CLAUDE_DIR/mcp-servers" ] && [ ! -L "$CLAUDE_DIR/mcp-servers" ]; then
-        [ -n "$(ls -A "$CLAUDE_DIR/mcp-servers" 2>/dev/null)" ] && return 0
-    fi
-    if [ -d "$CLAUDE_DIR/projects" ]; then
-        for d in "$CLAUDE_DIR/projects"/*/; do
-            [ -d "$d/memory" ] && [ ! -L "$d/memory" ] && return 0
+# Import scans every enabled agent; the first agent that provides a given
+# asset wins, so list your primary agent first in AGENT_SYNC_AGENTS.
+has_existing_agent_content() {
+    local agent asset rel d
+    while IFS= read -r agent; do
+        set_agent_context "$agent"
+        [ -d "$AGENT_HOME" ] || continue
+        for asset in instructions settings keybindings; do
+            rel="$(agent_asset "$agent" "$asset")"
+            [ -n "$rel" ] || continue
+            [ -f "$AGENT_HOME/$rel" ] && [ ! -L "$AGENT_HOME/$rel" ] && return 0
         done
-    fi
+        for asset in skills mcp-servers; do
+            rel="$(agent_asset "$agent" "$asset")"
+            [ -n "$rel" ] || continue
+            if [ -d "$AGENT_HOME/$rel" ] && [ ! -L "$AGENT_HOME/$rel" ]; then
+                [ -n "$(ls -A "$AGENT_HOME/$rel" 2>/dev/null)" ] && return 0
+            fi
+        done
+        rel="$(agent_asset "$agent" projects)"
+        if [ -n "$rel" ] && [ -d "$AGENT_HOME/$rel" ]; then
+            for d in "$AGENT_HOME/$rel"/*/; do
+                [ -d "$d/memory" ] && [ ! -L "$d/memory" ] && return 0
+            done
+        fi
+    done < <(enabled_agents)
     return 1
 }
 
-summarize_claude_content() {
-    [ -d "$CLAUDE_DIR" ] || return 0
-    local f n d
-    for f in settings.json CLAUDE.md keybindings.json; do
-        if [ -f "$CLAUDE_DIR/$f" ] && [ ! -L "$CLAUDE_DIR/$f" ]; then
-            echo "  $f ($(du -h "$CLAUDE_DIR/$f" 2>/dev/null | awk '{print $1}'))"
-        fi
-    done
-    if [ -d "$CLAUDE_DIR/skills" ] && [ ! -L "$CLAUDE_DIR/skills" ]; then
-        n=$(find "$CLAUDE_DIR/skills" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
-        [ "$n" -gt 0 ] && echo "  skills/ ($n skill(s))"
-    fi
-    if [ -d "$CLAUDE_DIR/mcp-servers" ] && [ ! -L "$CLAUDE_DIR/mcp-servers" ]; then
-        n=$(find "$CLAUDE_DIR/mcp-servers" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
-        [ "$n" -gt 0 ] && echo "  mcp-servers/ ($n server(s))"
-    fi
-    if [ -d "$CLAUDE_DIR/projects" ]; then
-        n=0
-        for d in "$CLAUDE_DIR/projects"/*/; do
-            [ -d "$d/memory" ] && [ ! -L "$d/memory" ] && n=$((n+1))
+summarize_agent_content() {
+    local agent asset rel n d
+    while IFS= read -r agent; do
+        set_agent_context "$agent"
+        [ -d "$AGENT_HOME" ] || continue
+        echo "  [$agent] $AGENT_HOME"
+        for asset in instructions settings keybindings; do
+            rel="$(agent_asset "$agent" "$asset")"
+            [ -n "$rel" ] || continue
+            if [ -f "$AGENT_HOME/$rel" ] && [ ! -L "$AGENT_HOME/$rel" ]; then
+                echo "    $rel ($(du -h "$AGENT_HOME/$rel" 2>/dev/null | awk '{print $1}'))"
+            fi
         done
-        [ "$n" -gt 0 ] && echo "  projects/ ($n project(s) with memory)"
-    fi
+        for asset in skills mcp-servers; do
+            rel="$(agent_asset "$agent" "$asset")"
+            [ -n "$rel" ] || continue
+            if [ -d "$AGENT_HOME/$rel" ] && [ ! -L "$AGENT_HOME/$rel" ]; then
+                n=$(find "$AGENT_HOME/$rel" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+                [ "$n" -gt 0 ] && echo "    $rel/ ($n entr(ies))"
+            fi
+        done
+        rel="$(agent_asset "$agent" projects)"
+        if [ -n "$rel" ] && [ -d "$AGENT_HOME/$rel" ]; then
+            n=0
+            for d in "$AGENT_HOME/$rel"/*/; do
+                [ -d "$d/memory" ] && [ ! -L "$d/memory" ] && n=$((n+1))
+            done
+            [ "$n" -gt 0 ] && echo "    $rel/ ($n project(s) with memory)"
+        fi
+    done < <(enabled_agents)
+    return 0
 }
 
 import_existing_top_level() {
     local target="$1"
-    local f srv_dir srv_name
-    for f in settings.json CLAUDE.md keybindings.json; do
-        if [ -f "$CLAUDE_DIR/$f" ] && [ ! -L "$CLAUDE_DIR/$f" ]; then
-            cp -p "$CLAUDE_DIR/$f" "$target/$f"
-            echo "  imported $f"
-        fi
-    done
-    if [ -d "$CLAUDE_DIR/skills" ] && [ ! -L "$CLAUDE_DIR/skills" ] \
-       && [ -n "$(ls -A "$CLAUDE_DIR/skills" 2>/dev/null)" ]; then
-        mkdir -p "$target/skills"
-        cp -R "$CLAUDE_DIR/skills/." "$target/skills/"
-        echo "  imported skills/"
-    fi
-    if [ -d "$CLAUDE_DIR/mcp-servers" ] && [ ! -L "$CLAUDE_DIR/mcp-servers" ]; then
-        local any=false
-        for srv_dir in "$CLAUDE_DIR/mcp-servers"/*/; do
-            [ ! -d "$srv_dir" ] && continue
-            srv_name="$(basename "$srv_dir")"
-            mkdir -p "$target/mcp-servers/$srv_name"
-            cp -R "$srv_dir/." "$target/mcp-servers/$srv_name/"
-            rm -rf "$target/mcp-servers/$srv_name/.venv"
-            any=true
+    local agent asset rel src dest srv_dir srv_name any
+    while IFS= read -r agent; do
+        set_agent_context "$agent"
+        [ -d "$AGENT_HOME" ] || continue
+
+        for asset in instructions settings keybindings; do
+            rel="$(agent_asset "$agent" "$asset")"
+            [ -n "$rel" ] || continue
+            src="$AGENT_HOME/$rel"
+            dest="$target/$(basename "$(asset_source "$asset")")"
+            [ -f "$src" ] && [ ! -L "$src" ] && [ ! -e "$dest" ] || continue
+            cp -p "$src" "$dest"
+            echo "  imported $(basename "$dest") (from $agent)"
         done
-        [ "$any" = true ] && echo "  imported mcp-servers/"
-    fi
+
+        rel="$(agent_asset "$agent" skills)"
+        if [ -n "$rel" ] && [ -d "$AGENT_HOME/$rel" ] && [ ! -L "$AGENT_HOME/$rel" ] \
+           && [ -n "$(ls -A "$AGENT_HOME/$rel" 2>/dev/null)" ]; then
+            mkdir -p "$target/skills"
+            cp -Rn "$AGENT_HOME/$rel/." "$target/skills/" 2>/dev/null || true
+            echo "  imported skills/ (from $agent)"
+        fi
+
+        rel="$(agent_asset "$agent" mcp-servers)"
+        if [ -n "$rel" ] && [ -d "$AGENT_HOME/$rel" ] && [ ! -L "$AGENT_HOME/$rel" ]; then
+            any=false
+            for srv_dir in "$AGENT_HOME/$rel"/*/; do
+                [ ! -d "$srv_dir" ] && continue
+                srv_name="$(basename "$srv_dir")"
+                [ -e "$target/mcp-servers/$srv_name" ] && continue
+                mkdir -p "$target/mcp-servers/$srv_name"
+                cp -R "$srv_dir/." "$target/mcp-servers/$srv_name/"
+                rm -rf "$target/mcp-servers/$srv_name/.venv"
+                any=true
+            done
+            [ "$any" = true ] && echo "  imported mcp-servers/ (from $agent)"
+        fi
+    done < <(enabled_agents)
     return 0
 }
 
@@ -998,18 +1253,18 @@ write_data_repo_scaffold() {
         git -C "$target" init -q -b main 2>/dev/null || git -C "$target" init -q
     fi
     cat > "$target/.gitignore" <<'EOF'
-# claude-sync data directory — allowlist style.
+# agent-sync data directory — allowlist style.
 # Ignore everything by default, then re-enable what should sync.
 *
 
 !.gitignore
-!.claude-sync-data
-!.claude-sync-projects
+!.agent-sync-data
+!.agent-sync-projects
 !README.md
 
 # Top-level config
 !settings.json
-!CLAUDE.md
+!instructions.md
 !keybindings.json
 
 # Custom skills
@@ -1031,7 +1286,7 @@ mcp-servers/*/.venv/
 # Ignore conversation logs and other ephemera
 projects/*/*.jsonl
 EOF
-    touch "$target/.claude-sync-data"
+    touch "$target/.agent-sync-data"
 }
 
 print_init_next_steps() {
@@ -1040,23 +1295,25 @@ print_init_next_steps() {
     echo "Next steps:"
     echo "  1. Install the managed shell env block:"
     printf '       '
-    [ "$BACKEND" != "git" ] && printf 'CLAUDE_SYNC_BACKEND="%s" ' "$BACKEND"
-    [ -n "$STORAGE_URI" ] && printf 'CLAUDE_SYNC_STORAGE_URI="%s" ' "$STORAGE_URI"
-    [ -n "$WORKDIR" ] && printf 'CLAUDE_SYNC_WORKDIR="%s" ' "$WORKDIR"
-    printf 'CLAUDE_SYNC_DIR="%s" claude-sync env install\n' "$target"
+    [ "$BACKEND" != "git" ] && printf 'AGENT_SYNC_BACKEND="%s" ' "$BACKEND"
+    [ -n "$STORAGE_URI" ] && printf 'AGENT_SYNC_STORAGE_URI="%s" ' "$STORAGE_URI"
+    [ -n "$WORKDIR" ] && printf 'AGENT_SYNC_WORKDIR="%s" ' "$WORKDIR"
+    [ "$AGENTS_ENABLED" != "$DEFAULT_AGENTS" ] && printf 'AGENT_SYNC_AGENTS="%s" ' "$AGENTS_ENABLED"
+    printf 'AGENT_SYNC_DIR="%s" agent-sync env install\n' "$target"
     echo "     Or add manually to your shell profile:"
-    echo "       export CLAUDE_SYNC_DIR=\"$target\""
-    [ "$BACKEND" != "git" ] && echo "       export CLAUDE_SYNC_BACKEND=\"$BACKEND\""
-    [ -n "$STORAGE_URI" ] && echo "       export CLAUDE_SYNC_STORAGE_URI=\"$STORAGE_URI\""
-    [ -n "$WORKDIR" ] && echo "       export CLAUDE_SYNC_WORKDIR=\"$WORKDIR\""
+    echo "       export AGENT_SYNC_DIR=\"$target\""
+    [ "$BACKEND" != "git" ] && echo "       export AGENT_SYNC_BACKEND=\"$BACKEND\""
+    [ -n "$STORAGE_URI" ] && echo "       export AGENT_SYNC_STORAGE_URI=\"$STORAGE_URI\""
+    [ -n "$WORKDIR" ] && echo "       export AGENT_SYNC_WORKDIR=\"$WORKDIR\""
+    [ "$AGENTS_ENABLED" != "$DEFAULT_AGENTS" ] && echo "       export AGENT_SYNC_AGENTS=\"$AGENTS_ENABLED\""
     if [ "$BACKEND" = "git" ] && [ "$include_remote" = true ]; then
         echo "  2. Add a private remote (recommended):"
         echo "       git -C \"$target\" remote add origin git@github.com:USER/REPO.git"
         echo "  3. Set up symlinks:"
-        echo "       CLAUDE_SYNC_DIR=\"$target\" claude-sync link"
+        echo "       AGENT_SYNC_DIR=\"$target\" agent-sync link"
     else
         echo "  2. Set up symlinks:"
-        echo "       CLAUDE_SYNC_DIR=\"$target\" claude-sync link"
+        echo "       AGENT_SYNC_DIR=\"$target\" agent-sync link"
     fi
 }
 
@@ -1073,13 +1330,13 @@ do_init_create() {
 
     if [ "$import" = true ]; then
         echo ""
-        echo "Importing from $CLAUDE_DIR ..."
-        import_existing_top_level "$target"
+        echo "Importing from enabled agents ($AGENTS_ENABLED) ..."
         REPO_DIR="$target"
+        import_existing_top_level "$target"
         migrate_local_memory
         echo "Created $target with existing config imported."
     else
-        echo "Initialized empty claude-sync data directory at $target"
+        echo "Initialized empty agent-sync data directory at $target"
     fi
     print_init_next_steps "$target" true
 }
@@ -1094,7 +1351,7 @@ do_init() {
     fi
 
     if [ ! -t 0 ] || [ ! -t 1 ]; then
-        echo "Usage: claude-sync init <directory>" >&2
+        echo "Usage: agent-sync init <directory>" >&2
         echo "  (or run in a TTY for interactive mode)" >&2
         exit 1
     fi
@@ -1102,9 +1359,9 @@ do_init() {
     # Interactive wizard
     local import=false use_existing=false
 
-    if has_existing_claude_content; then
-        echo "Found existing Claude Code data in $CLAUDE_DIR:"
-        summarize_claude_content
+    if has_existing_agent_content; then
+        echo "Found existing agent data for: $AGENTS_ENABLED"
+        summarize_agent_content
         echo
         if prompt_yn "Make this a syncable data directory (all files including project memory)?"; then
             import=true
@@ -1113,7 +1370,7 @@ do_init() {
     fi
 
     if [ "$import" = false ]; then
-        if prompt_yn "Do you already have a claude-sync data directory on disk?" n; then
+        if prompt_yn "Do you already have an agent-sync data directory on disk?" n; then
             use_existing=true
         fi
         echo
@@ -1131,48 +1388,59 @@ do_init() {
         return 0
     fi
 
-    target="$(prompt_path "Data directory path" "$HOME/.claude-config-data")"
+    target="$(prompt_path "Data directory path" "$HOME/.agent-config-data")"
     do_init_create "$target" "$import"
 }
 
 print_usage() {
     cat <<'USAGE'
-Usage: claude-sync [-p PREFIX] [-w WORKDIR] <command>
+Usage: agent-sync [-p PREFIX] [-w WORKDIR] [-a AGENTS] <command>
 
 Commands:
   init [dir]   initialize a data directory (interactive wizard if dir omitted —
-               detects existing ~/.claude/ content and offers to import)
+               detects existing agent content and offers to import)
   sync         backend sync + link (default)
   push         push local data to the configured backend
   pull         pull backend data + link
-  link         set up / refresh symlinks
+  link         set up / refresh symlinks for every enabled agent
+  agents       list known agents, their homes, and which assets they accept
   match        preview, apply, or set project mappings
                (--dry-run to preview, --auto to apply suggestions,
                 LOCAL:CANONICAL for an explicit mapping)
-  agents       install/remove/status managed agent instructions
+  instructions install/remove/status the managed block in instructions.md
   env          install/remove/status/print managed shell env block
   unlink       remove data-directory-owned symlinks
-  clean        remove broken symlinks from ~/.claude/projects
+  clean        remove broken project memory symlinks
   status       show data directory, backend, projects, link health, and changes
   help         show this message
 
 Options:
   -p, --prefix PREFIX   device prefix (default: auto from $HOME)
-  -w, --workdir DIR     work directory under $HOME (default: $CLAUDE_SYNC_WORKDIR)
+  -w, --workdir DIR     work directory under $HOME (default: $AGENT_SYNC_WORKDIR)
+  -a, --agents LIST     comma-separated agents to link (default: claude)
+
+Agents:
+  claude    ~/.claude    instructions settings keybindings skills mcp-servers projects
+  tclaude   ~/.tclaude   instructions settings keybindings skills mcp-servers projects
+  codex     ~/.codex     instructions skills
+
+  Codex keeps its settings in config.toml and has no per-project memory store,
+  so only the instructions file and skills/ are shared with it.
 
 Environment:
-  CLAUDE_SYNC_DIR       path to your private data directory (required for
+  AGENT_SYNC_DIR        path to your private data directory (required for
                         every command except `init` and `help`)
-  CLAUDE_SYNC_BACKEND   storage backend: git, s3, gcs, or local (default: git)
-  CLAUDE_SYNC_STORAGE_URI
+  AGENT_SYNC_AGENTS     comma-separated agents to link (default: claude)
+  AGENT_SYNC_BACKEND    storage backend: git, s3, gcs, or local (default: git)
+  AGENT_SYNC_STORAGE_URI
                         s3://bucket/prefix or gs://bucket/prefix for object
                         storage backends
-  CLAUDE_SYNC_STORAGE_OBJECT
+  AGENT_SYNC_STORAGE_OBJECT
                         object name for s3/gcs archive
-                        (default: claude-sync-data.tar.gz)
-  CLAUDE_SYNC_WORKDIR   parent dir under $HOME to strip from canonical
+                        (default: agent-sync-data.tar.gz)
+  AGENT_SYNC_WORKDIR    parent dir under $HOME to strip from canonical
                         project names (e.g. "develop" strips ~/develop/)
-  CLAUDE_SYNC_REMOTE    git remote name for backend git (default: origin)
+  AGENT_SYNC_REMOTE     git remote name for backend git (default: origin)
 
 For backend git, the branch your data directory is currently on is used for
 push/pull, so `main`, `master`, or any other branch works.
@@ -1202,7 +1470,10 @@ case "$ACTION" in
         do_match
         ;;
     agents)
-        do_agents "${ARG1:-status}"
+        do_agents
+        ;;
+    instructions)
+        do_instructions "${ARG1:-status}"
         ;;
     env)
         do_env "${ARG1:-status}"
@@ -1258,6 +1529,7 @@ case "$ACTION" in
         cd "$REPO_DIR"
         echo "Data:    $REPO_DIR"
         echo "Backend: $BACKEND"
+        echo "Agents:  $AGENTS_ENABLED"
         echo "Prefix:  $PREFIX"
         [ -n "$WORKDIR" ] && echo "Workdir: ~/$WORKDIR"
         if [ "$BACKEND" = "git" ] && git remote get-url "$REMOTE" >/dev/null 2>&1; then
@@ -1280,14 +1552,14 @@ case "$ACTION" in
         done
         echo ""
 
-        if [ -f "$REPO_DIR/.claude-sync-projects" ]; then
+        if [ -f "$REPO_DIR/.agent-sync-projects" ]; then
             echo "Project mappings:"
             while IFS= read -r line || [ -n "$line" ]; do
                 case "$line" in
                     ""|\#*) continue ;;
                 esac
                 echo "  $line"
-            done < "$REPO_DIR/.claude-sync-projects"
+            done < "$REPO_DIR/.agent-sync-projects"
             echo ""
         fi
 
@@ -1336,24 +1608,33 @@ case "$ACTION" in
                 fi
             fi
         }
-        for f in settings.json keybindings.json CLAUDE.md; do
-            [ -f "$REPO_DIR/$f" ] && check_link "$f" "$CLAUDE_DIR/$f" "$REPO_DIR/"
-        done
-        [ -d "$REPO_DIR/skills" ] && check_link "skills" "$CLAUDE_DIR/skills" "$REPO_DIR/"
-        for canonical_mem in "$REPO_DIR"/projects/*/memory; do
-            [ ! -d "$canonical_mem" ] && continue
-            canonical="$(basename "$(dirname "$canonical_mem")")"
-            if [ "$canonical" = "_home" ]; then
-                device_name="$PREFIX"
-            else
-                device_name="${PREFIX}${canonical}"
-            fi
-            check_link "projects/$canonical" "$CLAUDE_DIR/projects/$device_name/memory" "$REPO_DIR/"
-        done
+        while IFS= read -r agent; do
+            set_agent_context "$agent"
+            for asset in instructions settings keybindings; do
+                rel="$(agent_asset "$agent" "$asset")"
+                [ -n "$rel" ] || continue
+                src="$(asset_source "$asset")"
+                [ -e "$src" ] || continue
+                check_link "$agent:$rel" "$AGENT_HOME/$rel" "$REPO_DIR/"
+            done
+            rel="$(agent_asset "$agent" projects)"
+            [ -n "$rel" ] || continue
+            for canonical_mem in "$REPO_DIR"/projects/*/memory; do
+                [ ! -d "$canonical_mem" ] && continue
+                canonical="$(basename "$(dirname "$canonical_mem")")"
+                if [ "$canonical" = "_home" ]; then
+                    device_name="$PREFIX"
+                else
+                    device_name="${PREFIX}${canonical}"
+                fi
+                check_link "$agent:projects/$canonical" \
+                    "$AGENT_HOME/$rel/$device_name/memory" "$REPO_DIR/"
+            done
+        done < <(enabled_agents)
         if [ -n "$health_lines" ]; then
             echo "Link health:"
             printf '%s' "$health_lines"
-            echo "  (run \`claude-sync link\` to repair)"
+            echo "  (run \`agent-sync link\` to repair)"
             echo ""
         fi
 
