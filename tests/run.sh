@@ -4,6 +4,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$ROOT/bin/agent-sync"
 
+# The developer's own AGENT_SYNC_* environment must not reach the tests: an
+# exported AGENT_SYNC_AGENTS silently defeats every default-is-claude-only
+# assertion. Tests that need a variable set it themselves, per invocation.
+unset AGENT_SYNC_AGENTS AGENT_SYNC_DIR AGENT_SYNC_BACKEND AGENT_SYNC_REMOTE
+unset AGENT_SYNC_STORAGE_OBJECT AGENT_SYNC_STORAGE_URI AGENT_SYNC_WORKDIR
+
 pass_count=0
 tmp_dirs=()
 
