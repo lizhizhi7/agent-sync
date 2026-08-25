@@ -290,7 +290,11 @@ env_profiles() {
 }
 
 git_branch() {
-    git -C "$REPO_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null
+    # symbolic-ref works on an unborn branch, before the first commit exists.
+    # Fall back to rev-parse so detached HEAD still returns the literal "HEAD"
+    # and backend_require() can reject it with a useful error.
+    git -C "$REPO_DIR" symbolic-ref --quiet --short HEAD 2>/dev/null \
+        || git -C "$REPO_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null
 }
 
 require_remote() {
@@ -532,6 +536,37 @@ canonical_for_device_project() {
     else
         printf '%s\n' "$device_name"
     fi
+}
+
+device_project_name_for_path() {
+    local path="$1" root common_dir common_parent
+    [ -d "$path" ] || die "project path does not exist or is not a directory: $path"
+    path="$(cd "$path" && pwd -P)"
+    root="$(git -C "$path" rev-parse --show-toplevel 2>/dev/null || printf '%s\n' "$path")"
+
+    # A linked git worktree has its own checkout path, but project memory
+    # belongs to the repository. Resolve the primary worktree through the
+    # common git directory so every worktree reaches the same canonical data.
+    common_dir="$(git -C "$root" rev-parse --git-common-dir 2>/dev/null || true)"
+    if [ -n "$common_dir" ]; then
+        case "$common_dir" in
+            /*) : ;;
+            *) common_dir="$root/$common_dir" ;;
+        esac
+        common_dir="$(cd "$common_dir" 2>/dev/null && pwd -P || true)"
+        if [ -n "$common_dir" ] && [ "$(basename "$common_dir")" = ".git" ]; then
+            common_parent="$(dirname "$common_dir")"
+            [ -d "$common_parent" ] && root="$common_parent"
+        fi
+    fi
+
+    printf '%s\n' "$(printf '%s' "$root" | tr '/' '-')"
+}
+
+canonical_for_project_path() {
+    local path="$1" device_name
+    device_name="$(device_project_name_for_path "$path")"
+    canonical_for_device_project "$device_name"
 }
 
 project_mapping_lookup() {
@@ -931,6 +966,7 @@ agent_instruction_body() {
 Use agent-sync for durable agent configuration and memory changes on this machine:
 
 - Run `agent-sync status` before changing synced config or project memory when context is unclear.
+- Agents without native access to synced project memory (including Codex) must run `agent-sync memory` at the start of repository work, use its `MEMORY.md` output as the index, and read relevant detail files before acting.
 - Run `agent-sync match` if a project appears under a new local project name.
 - Run `agent-sync sync` after changes that should be shared across devices.
 - Do not edit shell profiles, unlink synced files, or delete local agent data unless the user asks.
@@ -1110,6 +1146,44 @@ do_match() {
     elif [ "$applied" -gt 0 ]; then
         echo "Applied $applied project mapping(s)."
     fi
+}
+
+# Print the curated cross-agent memory index for a repository. Claude-family
+# agents consume the same directory through their native project-memory path;
+# agents without that path (notably Codex) use this command from their global
+# instructions instead of writing into framework-generated memory stores.
+do_memory() {
+    local project_path="${1:-$PWD}" canonical memory_dir index file found=false
+    canonical="$(canonical_for_project_path "$project_path")"
+    memory_dir="$REPO_DIR/projects/$canonical/memory"
+    index="$memory_dir/MEMORY.md"
+
+    if [ ! -d "$memory_dir" ]; then
+        echo "No synced project memory for $project_path (canonical: $canonical)." >&2
+        echo "Run 'agent-sync match' if this repository is stored under another name." >&2
+        return 1
+    fi
+
+    echo "Project memory: $memory_dir"
+    echo "Canonical project: $canonical"
+    echo ""
+    if [ -f "$index" ]; then
+        cat "$index"
+        found=true
+    else
+        echo "No MEMORY.md index. Available memory files:"
+    fi
+
+    for file in "$memory_dir"/*; do
+        [ -f "$file" ] || continue
+        [ "$file" = "$index" ] && continue
+        if [ "$found" = true ]; then
+            echo ""
+            echo "Detail file: $file"
+        else
+            echo "  $file"
+        fi
+    done
 }
 
 # ---------- init ----------
@@ -1404,6 +1478,7 @@ Commands:
   pull         pull backend data + link
   link         set up / refresh symlinks for every enabled agent
   agents       list known agents, their homes, and which assets they accept
+  memory [dir] print the canonical project-memory index for a repository
   match        preview, apply, or set project mappings
                (--dry-run to preview, --auto to apply suggestions,
                 LOCAL:CANONICAL for an explicit mapping)
@@ -1424,8 +1499,9 @@ Agents:
   tclaude   ~/.tclaude   instructions settings keybindings skills mcp-servers projects
   codex     ~/.codex     instructions skills
 
-  Codex keeps its settings in config.toml and has no per-project memory store,
-  so only the instructions file and skills/ are shared with it.
+  Codex keeps its settings in config.toml. Its native memories are generated
+  state, so curated project memory is exposed through `agent-sync memory`
+  instead of being linked into that store.
 
 Environment:
   AGENT_SYNC_DIR        path to your private data directory (required for
@@ -1471,6 +1547,9 @@ case "$ACTION" in
         ;;
     agents)
         do_agents
+        ;;
+    memory)
+        do_memory "$ARG1"
         ;;
     instructions)
         do_instructions "${ARG1:-status}"
