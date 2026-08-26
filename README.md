@@ -12,9 +12,9 @@ One data directory feeds several agents. Each agent declares where its home is a
 |---|---|---|---|---|---|---|---|
 | `claude` | `~/.claude` | `CLAUDE.md` | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `tclaude` | `~/.tclaude` | `CLAUDE.md` | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `codex` | `~/.codex` | `AGENTS.md` | — | — | ✅ | — | — |
+| `codex` | `~/.codex` | `AGENTS.md` | — | — | ✅ | — | via `agent-sync memory` |
 
-Codex keeps its settings in `config.toml` (TOML, and MCP servers are registered inside that same file rather than as a directory) and has no per-project memory store, so only the shared instructions file and `skills/` are linked into it.
+Codex keeps its settings in `config.toml` (TOML, and MCP servers are registered inside that same file rather than as a directory). Its native `~/.codex/memories/` content is generated state rather than a curated project-memory interface, so `agent-sync` leaves it device-local. The shared instruction block tells Codex to load the canonical curated memory through `agent-sync memory` instead.
 
 Only `claude` is enabled by default. Opt the others in explicitly — linking your global instructions into another agent's home changes that agent's behavior in every session, so it is never done on autodetection alone:
 
@@ -68,6 +68,14 @@ $AGENT_SYNC_DIR/projects/-myapp/memory/
 ```
 
 Both agents use the identical naming scheme, so one mapping file covers both.
+
+Codex loads required guidance through `AGENTS.md`. Because the shared project memories may be much larger than Codex's instruction-file budget, `agent-sync` does not copy them into the global file or into Codex's generated memory store. Instead, run this inside a repository:
+
+```bash
+agent-sync memory
+```
+
+The command resolves the repository (including linked git worktrees), prints its canonical `MEMORY.md` index, and lists the paths of detail files. `agent-sync instructions install` adds a managed global instruction requiring agents without native project-memory access to do this at the start of repository work.
 
 Top-level config files, skills, and MCP server source files are symlinked the same way. Existing local files are backed up under `<agent home>/backups/agent-sync-*` before being replaced by symlinks.
 
@@ -170,6 +178,7 @@ agent-sync push          push local data to the backend
 agent-sync pull          pull backend data + link
 agent-sync link          set up or refresh symlinks for every enabled agent
 agent-sync agents        list known agents, homes, and the assets they accept
+agent-sync memory [dir]  print a repository's canonical memory index
 agent-sync match         preview, apply, or set project mappings
 agent-sync instructions  install/remove/status the managed instruction block
 agent-sync env           install/remove/status/print managed shell env block

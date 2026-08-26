@@ -262,6 +262,28 @@ test_git_backend_rejects_nested_data_dir() {
     git -C "$outer" diff --cached --quiet || { echo "outer repo was staged by agent-sync" >&2; exit 1; }
 }
 
+test_git_first_push_to_empty_remote() {
+    local tmp home data remote
+    tmp="$(new_tmp)"
+    home="$tmp/home"
+    data="$tmp/data"
+    remote="$tmp/remote.git"
+    mkdir -p "$home"
+    git init -q --bare "$remote"
+
+    HOME="$home" AGENT_SYNC_BACKEND=git agent_sync init "$data" >/dev/null
+    git -C "$data" remote add origin "$remote"
+    git -C "$data" config user.name agent-sync-test
+    git -C "$data" config user.email agent-sync-test@example.invalid
+
+    HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=git agent_sync push >/dev/null
+
+    git --git-dir="$remote" show-ref --verify --quiet refs/heads/main \
+        || { echo "first push did not create remote main branch" >&2; exit 1; }
+    git --git-dir="$remote" show main:.agent-sync-data >/dev/null \
+        || { echo "first push did not include initialized data" >&2; exit 1; }
+}
+
 test_mcp_server_links_preserve_venv_and_prune_stale() {
     local tmp home data target
     tmp="$(new_tmp)"
@@ -419,6 +441,7 @@ test_instructions_install_and_remove_managed_block() {
     HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local agent_sync instructions install >/dev/null
 
     grep -Fqx '<!-- >>> agent-sync:auto-sync >>> -->' "$data/instructions.md" || { echo "instruction block missing" >&2; exit 1; }
+    grep -Fq "must run \`agent-sync memory\`" "$data/instructions.md" || { echo "project-memory instruction missing" >&2; exit 1; }
 
     # One shared file reaches every agent through its own linked name.
     HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local AGENT_SYNC_AGENTS=claude,codex agent_sync link >/dev/null
@@ -429,6 +452,33 @@ test_instructions_install_and_remove_managed_block() {
 
     ! grep -Fqx '<!-- >>> agent-sync:auto-sync >>> -->' "$data/instructions.md" || { echo "instruction block was not removed" >&2; exit 1; }
     grep -Fqx 'existing note' "$data/instructions.md" || { echo "existing content was not preserved" >&2; exit 1; }
+}
+
+test_memory_prints_index_and_resolves_worktree() {
+    local tmp home data repo linked canonical output home_prefix
+    tmp="$(new_tmp)"
+    home="$tmp/home"
+    data="$tmp/data"
+    repo="$home/repo"
+    linked="$tmp/repo-worktree"
+    home_prefix="$(printf '%s' "$home" | tr '/' '-')"
+    canonical="$(printf '%s' "$repo" | tr '/' '-')"
+    canonical="${canonical#"$home_prefix"}"
+    mkdir -p "$home" "$data/projects/$canonical/memory"
+    touch "$data/.agent-sync-data"
+    printf 'index marker\n' > "$data/projects/$canonical/memory/MEMORY.md"
+    printf 'detail marker\n' > "$data/projects/$canonical/memory/detail.md"
+    git init -q -b main "$repo" 2>/dev/null || git init -q "$repo"
+    git -C "$repo" config user.name agent-sync-test
+    git -C "$repo" config user.email agent-sync-test@example.invalid
+    git -C "$repo" commit -q --allow-empty -m initial
+    git -C "$repo" worktree add -q -b test-worktree "$linked"
+
+    output="$(HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local agent_sync memory "$linked")"
+
+    [[ "$output" == *"index marker"* ]] || { echo "memory index was not printed" >&2; exit 1; }
+    [[ "$output" == *"Detail file: $data/projects/$canonical/memory/detail.md"* ]] \
+        || { echo "memory detail path was not printed" >&2; exit 1; }
 }
 
 test_skills_link_per_entry_and_keep_vendor_skills() {
@@ -577,6 +627,7 @@ run_test "s3 push archives only allowlisted data" test_s3_push_uses_allowlisted_
 run_test "s3 pull rejects symlink archives" test_s3_pull_rejects_symlink_archive
 run_test "help runs without any agent-sync env" test_help_runs_without_any_env
 run_test "git backend rejects nested data dir" test_git_backend_rejects_nested_data_dir
+run_test "git first push bootstraps an empty remote" test_git_first_push_to_empty_remote
 run_test "mcp-server links preserve .venv and prune stale" test_mcp_server_links_preserve_venv_and_prune_stale
 run_test "s3 pull rejects hardlink archives" test_s3_pull_rejects_hardlink_archive
 run_test "match preview does not modify data" test_match_preview_does_not_modify
@@ -584,6 +635,7 @@ run_test "match auto applies suggested mapping" test_match_auto_applies_suggeste
 run_test "match explicit mapping overrides suggestion" test_match_explicit_mapping_overrides_suggestion
 run_test "env install/remove manages only marked block" test_env_install_and_remove_managed_block
 run_test "instructions install/remove manages marked block" test_instructions_install_and_remove_managed_block
+run_test "memory prints index and resolves linked worktrees" test_memory_prints_index_and_resolves_worktree
 run_test "skills link per entry and keep vendor skills" test_skills_link_per_entry_and_keep_vendor_skills
 run_test "links several agents from one data dir" test_links_multiple_agents_from_one_data_dir
 run_test "link leaves disabled agents untouched" test_link_leaves_disabled_agents_untouched
