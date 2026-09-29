@@ -634,8 +634,12 @@ test_skill_vendor_update_keeps_local_edits() {
     printf 'unrelated\n' > "$up/README.md"
     g add -A && g commit -qm one
 
+    mkdir -p "$up/pkg/child"
+    printf 'name: child\n' > "$up/pkg/child/SKILL.md"
+    g add -A && g commit -qm nested
     HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local agent_sync skill add s "$up" pkg >/dev/null
     assert_file "$data/skills/s/SKILL.md"
+    [ ! -e "$data/skills/s/child" ] || { echo "a nested skill was vendored inside its parent" >&2; exit 1; }
     [ ! -e "$data/skills/s/README.md" ] || { echo "vendored outside the skill path" >&2; exit 1; }
     grep -q "^ref=$(g rev-parse HEAD)$" "$data/skills/s/.upstream" || { echo "ref not pinned" >&2; exit 1; }
 
