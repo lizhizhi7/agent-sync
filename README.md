@@ -268,7 +268,8 @@ agent-sync skill diff ci-helper        # what we changed, against the pinned ups
 agent-sync skill update ci-helper [ref] # move to a new upstream ref (default: latest)
 ```
 
-`add` copies the skill directory (the one holding `SKILL.md`) and writes
+`add` copies the skill directory (the one holding `SKILL.md`, minus any
+subdirectory holding its own `SKILL.md`: that is another skill) and writes
 `skills/<name>/.upstream` with its source, path, and the exact ref it resolved
 to. Edit the vendored files in place, as you would your own skill. `update`
 merges each file three ways (base = the pinned upstream, ours = your

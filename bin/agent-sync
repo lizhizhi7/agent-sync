@@ -1548,6 +1548,12 @@ fetch_skill_source() {
     mkdir -p "$dest"
     ( cd "$root/$path" && tar -cf - --exclude=.git . ) | ( cd "$dest" && tar -xf - )
     rm -rf "$work"
+    # A directory below the skill that holds its own SKILL.md is another skill (an index
+    # skill at the root of a collection), vendored under its own name, never inside this one.
+    local nested
+    while IFS= read -r nested; do
+        rm -rf "$(dirname "$nested")"
+    done < <(find "$dest" -mindepth 2 -name SKILL.md)
     printf '%s\n' "$resolved"
 }
 
