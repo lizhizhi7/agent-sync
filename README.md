@@ -182,6 +182,7 @@ agent-sync memory [dir]  print a repository's canonical memory index
 agent-sync match         preview, apply, or set project mappings
 agent-sync instructions  install/remove/status the managed instruction block
 agent-sync env           install/remove/status/print managed shell env block
+agent-sync skill         list/add/diff/update skills vendored from other repos
 agent-sync unlink        remove data-directory-owned symlinks only
 agent-sync clean         remove broken project memory symlinks
 agent-sync status        show backend, agents, projects, link health, and changes
@@ -254,7 +255,35 @@ To inspect the block without editing files:
 agent-sync env print
 ```
 
-## Configuration
+## Vendored Skills
+
+A skill you copy from another team's repository or npm package should stay
+updatable after you change it. `agent-sync skill` keeps that record:
+
+```bash
+agent-sync skill add devops git@example.com:team/skills.git devops   # <name> <source> [path] [ref]
+agent-sync skill add helper npm:@team/helper-skill                   # npm: sources use `npm pack`
+agent-sync skill list                  # every vendored skill, its source and pinned ref
+agent-sync skill diff devops           # what we changed, against the pinned upstream
+agent-sync skill update devops [ref]   # move to a new upstream ref (default: latest)
+```
+
+`add` copies the skill directory (the one holding `SKILL.md`) and writes
+`skills/<name>/.upstream` with its source, path, and the exact ref it resolved
+to. Edit the vendored files in place, as you would your own skill. `update`
+merges each file three ways (base = the pinned upstream, ours = your
+directory, theirs = the new upstream): files you never touched take upstream's
+version, your edits survive, and a clash is left with conflict markers and a
+non-zero exit instead of being silently overwritten. Files upstream never had
+(your notes, sidecars) are left alone. Review with `git diff`, then
+`agent-sync sync`.
+
+Prefer adapting a vendored skill from outside (environment variables, a
+sidecar file of your own) over editing its files: every edit is a potential
+conflict on the next update. Some skills keep a local token in their own
+directory (often `config.json`); ignore that path in the data directory's
+`.gitignore` so it never syncs.
+
 
 | Env var | Meaning |
 |---|---|

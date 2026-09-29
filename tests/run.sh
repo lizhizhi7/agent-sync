@@ -618,6 +618,59 @@ EOF
     grep -Fqx 'export KEEP_ME=1' "$home/.zshrc" || { echo "unrelated shell config was removed by unlink --env" >&2; exit 1; }
 }
 
+test_skill_vendor_update_keeps_local_edits() {
+    local tmp home data up
+    tmp="$(new_tmp)"
+    home="$tmp/home"
+    data="$tmp/data"
+    up="$tmp/upstream"
+    mkdir -p "$home" "$data" "$up/pkg/scripts"
+    touch "$data/.agent-sync-data"
+    g() { git -C "$up" -c user.name=t -c user.email=t@t "$@"; }
+    git init -q "$up"
+    printf 'name: s\nline2\nline3\nline4\nline5\n' > "$up/pkg/SKILL.md"
+    printf 'print(1)\n' > "$up/pkg/scripts/a.py"
+    printf 'old\n' > "$up/pkg/gone.md"
+    printf 'unrelated\n' > "$up/README.md"
+    g add -A && g commit -qm one
+
+    HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local agent_sync skill add s "$up" pkg >/dev/null
+    assert_file "$data/skills/s/SKILL.md"
+    [ ! -e "$data/skills/s/README.md" ] || { echo "vendored outside the skill path" >&2; exit 1; }
+    grep -q "^ref=$(g rev-parse HEAD)$" "$data/skills/s/.upstream" || { echo "ref not pinned" >&2; exit 1; }
+
+    # Our edits: a line in SKILL.md, a sidecar upstream never had.
+    sed -i.bak 's/^line2$/line2 ours/' "$data/skills/s/SKILL.md" && rm -f "$data/skills/s/SKILL.md.bak"
+    printf '{}\n' > "$data/skills/s/.agtrace.json"
+    HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local agent_sync skill diff s \
+        | grep -q '^+line2 ours$' || { echo "diff does not show our edit" >&2; exit 1; }
+
+    # Upstream: another line of SKILL.md, a script change, a removed and an added file.
+    sed -i.bak 's/^line5$/line5 theirs/' "$up/pkg/SKILL.md" && rm -f "$up/pkg/SKILL.md.bak"
+    printf 'print(2)\n' > "$up/pkg/scripts/a.py"
+    g rm -q pkg/gone.md
+    printf 'new\n' > "$up/pkg/new.md"
+    g add -A && g commit -qm two
+
+    HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local agent_sync skill update s >/dev/null
+    grep -qx 'line2 ours' "$data/skills/s/SKILL.md" || { echo "our edit was lost" >&2; exit 1; }
+    grep -qx 'line5 theirs' "$data/skills/s/SKILL.md" || { echo "upstream edit not merged" >&2; exit 1; }
+    grep -qx 'print(2)' "$data/skills/s/scripts/a.py" || { echo "untouched file not updated" >&2; exit 1; }
+    [ ! -e "$data/skills/s/gone.md" ] || { echo "upstream removal not applied" >&2; exit 1; }
+    assert_file "$data/skills/s/new.md"
+    assert_file "$data/skills/s/.agtrace.json"
+    grep -q "^ref=$(g rev-parse HEAD)$" "$data/skills/s/.upstream" || { echo "ref not moved" >&2; exit 1; }
+
+    # A clash on the same line is a conflict, reported and left with markers.
+    sed -i.bak 's/^line2 ours$/line2 ours again/' "$data/skills/s/SKILL.md" && rm -f "$data/skills/s/SKILL.md.bak"
+    sed -i.bak 's/^line2$/line2 theirs/' "$up/pkg/SKILL.md" && rm -f "$up/pkg/SKILL.md.bak"
+    g add -A && g commit -qm three
+    if HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local agent_sync skill update s >/dev/null 2>&1; then
+        echo "a conflicting update reported success" >&2; exit 1
+    fi
+    grep -q '^<<<<<<< ours' "$data/skills/s/SKILL.md" || { echo "no conflict markers" >&2; exit 1; }
+}
+
 run_test "init supports local backend" test_init_local_backend
 run_test "link backs up existing config before symlink" test_link_backs_up_existing_config
 run_test "project memory migration includes dotfiles" test_migrates_dotfiles_in_project_memory
@@ -642,5 +695,6 @@ run_test "link leaves disabled agents untouched" test_link_leaves_disabled_agent
 run_test "unlink only touches enabled agents" test_unlink_only_touches_enabled_agents
 run_test "unknown agent names are rejected" test_rejects_unknown_agent
 run_test "unlink --env removes managed env block" test_unlink_env_removes_managed_env_block
+run_test "skill update merges upstream and keeps local edits" test_skill_vendor_update_keeps_local_edits
 
 printf 'ok: %s tests passed\n' "$pass_count"
