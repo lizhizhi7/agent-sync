@@ -553,7 +553,11 @@ device_project_name_for_path() {
             /*) : ;;
             *) common_dir="$root/$common_dir" ;;
         esac
-        common_dir="$(cd "$common_dir" 2>/dev/null && pwd -P || true)"
+        if [ -d "$common_dir" ]; then
+            common_dir="$(cd "$common_dir" && pwd -P)"
+        else
+            common_dir=""
+        fi
         if [ -n "$common_dir" ] && [ "$(basename "$common_dir")" = ".git" ]; then
             common_parent="$(dirname "$common_dir")"
             [ -d "$common_parent" ] && root="$common_parent"
@@ -1290,7 +1294,9 @@ import_existing_top_level() {
             [ -n "$rel" ] || continue
             src="$AGENT_HOME/$rel"
             dest="$target/$(basename "$(asset_source "$asset")")"
-            [ -f "$src" ] && [ ! -L "$src" ] && [ ! -e "$dest" ] || continue
+            if [ ! -f "$src" ] || [ -L "$src" ] || [ -e "$dest" ]; then
+                continue
+            fi
             cp -p "$src" "$dest"
             echo "  imported $(basename "$dest") (from $agent)"
         done
@@ -1587,7 +1593,9 @@ skill_origin() {
     SKILL_SOURCE="$(upstream_value "$up" source)"
     SKILL_PATH="$(upstream_value "$up" path)"
     SKILL_REF="$(upstream_value "$up" ref)"
-    [ -n "$SKILL_SOURCE" ] && [ -n "$SKILL_REF" ] || die "$up lacks source or ref"
+    if [ -z "$SKILL_SOURCE" ] || [ -z "$SKILL_REF" ]; then
+        die "$up lacks source or ref"
+    fi
 }
 
 skill_diff() {

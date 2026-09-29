@@ -261,11 +261,11 @@ A skill you copy from another team's repository or npm package should stay
 updatable after you change it. `agent-sync skill` keeps that record:
 
 ```bash
-agent-sync skill add devops git@example.com:team/skills.git devops   # <name> <source> [path] [ref]
+agent-sync skill add ci-helper https://git.example.com/team/skills.git ci-helper   # <name> <source> [path] [ref]
 agent-sync skill add helper npm:@team/helper-skill                   # npm: sources use `npm pack`
 agent-sync skill list                  # every vendored skill, its source and pinned ref
-agent-sync skill diff devops           # what we changed, against the pinned upstream
-agent-sync skill update devops [ref]   # move to a new upstream ref (default: latest)
+agent-sync skill diff ci-helper        # what we changed, against the pinned upstream
+agent-sync skill update ci-helper [ref] # move to a new upstream ref (default: latest)
 ```
 
 `add` copies the skill directory (the one holding `SKILL.md`) and writes

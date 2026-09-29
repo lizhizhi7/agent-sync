@@ -641,7 +641,7 @@ test_skill_vendor_update_keeps_local_edits() {
 
     # Our edits: a line in SKILL.md, a sidecar upstream never had.
     sed -i.bak 's/^line2$/line2 ours/' "$data/skills/s/SKILL.md" && rm -f "$data/skills/s/SKILL.md.bak"
-    printf '{}\n' > "$data/skills/s/.agtrace.json"
+    printf '{}\n' > "$data/skills/s/notes.md"
     HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local agent_sync skill diff s \
         | grep -q '^+line2 ours$' || { echo "diff does not show our edit" >&2; exit 1; }
 
@@ -658,7 +658,7 @@ test_skill_vendor_update_keeps_local_edits() {
     grep -qx 'print(2)' "$data/skills/s/scripts/a.py" || { echo "untouched file not updated" >&2; exit 1; }
     [ ! -e "$data/skills/s/gone.md" ] || { echo "upstream removal not applied" >&2; exit 1; }
     assert_file "$data/skills/s/new.md"
-    assert_file "$data/skills/s/.agtrace.json"
+    assert_file "$data/skills/s/notes.md"
     grep -q "^ref=$(g rev-parse HEAD)$" "$data/skills/s/.upstream" || { echo "ref not moved" >&2; exit 1; }
 
     # A clash on the same line is a conflict, reported and left with markers.
