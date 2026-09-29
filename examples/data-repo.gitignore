@@ -17,6 +17,7 @@
 # Custom skills
 !skills/
 !skills/**
+skills/**/__pycache__/
 
 # Custom MCP servers (code only — keep .venv device-local)
 !mcp-servers/

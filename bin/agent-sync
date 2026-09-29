@@ -553,7 +553,11 @@ device_project_name_for_path() {
             /*) : ;;
             *) common_dir="$root/$common_dir" ;;
         esac
-        common_dir="$(cd "$common_dir" 2>/dev/null && pwd -P || true)"
+        if [ -d "$common_dir" ]; then
+            common_dir="$(cd "$common_dir" && pwd -P)"
+        else
+            common_dir=""
+        fi
         if [ -n "$common_dir" ] && [ "$(basename "$common_dir")" = ".git" ]; then
             common_parent="$(dirname "$common_dir")"
             [ -d "$common_parent" ] && root="$common_parent"
@@ -1290,7 +1294,9 @@ import_existing_top_level() {
             [ -n "$rel" ] || continue
             src="$AGENT_HOME/$rel"
             dest="$target/$(basename "$(asset_source "$asset")")"
-            [ -f "$src" ] && [ ! -L "$src" ] && [ ! -e "$dest" ] || continue
+            if [ ! -f "$src" ] || [ -L "$src" ] || [ -e "$dest" ]; then
+                continue
+            fi
             cp -p "$src" "$dest"
             echo "  imported $(basename "$dest") (from $agent)"
         done
@@ -1466,6 +1472,235 @@ do_init() {
     do_init_create "$target" "$import"
 }
 
+# ---------- vendored skills ----------
+
+# A skill copied from another team's repository or package records where it
+# came from in skills/<name>/.upstream (key=value lines: source, path, ref,
+# updated). Its directory holds upstream's files plus whatever we changed.
+# `skill diff` shows those changes against the pinned upstream; `skill update`
+# moves to a new upstream ref with a three-way merge per file (base = pinned
+# upstream, ours = the directory, theirs = the new upstream), so our changes
+# survive and a clash becomes conflict markers instead of silent drift. Files
+# upstream never had (our sidecars and notes) are never touched.
+
+SKILL_UPSTREAM_FILE=".upstream"
+
+upstream_value() {
+    sed -n "s/^$2=//p" "$1" | head -n 1
+}
+
+skill_dir_for() {
+    case "$1" in
+        ""|.*|*/*) die "invalid skill name '$1'" ;;
+    esac
+    printf '%s\n' "$REPO_DIR/skills/$1"
+}
+
+# fetch_skill_source SOURCE PATH REF DEST
+# Copy the skill at PATH inside SOURCE (a git URL, or npm:<package>) at REF
+# (empty = latest) into DEST, and print the exact ref it resolved to: a commit
+# for git, a version for npm.
+fetch_skill_source() {
+    local source="$1" path="$2" ref="$3" dest="$4" work root resolved tarball spec
+    work="$(mktemp -d)"
+    case "$source" in
+        npm:*)
+            command_exists npm || { rm -rf "$work"; die "npm is required for $source"; }
+            spec="${source#npm:}"
+            [ -n "$ref" ] && spec="$spec@$ref"
+            if ! ( cd "$work" && npm pack --silent "$spec" >/dev/null ); then
+                rm -rf "$work"
+                die "npm pack $spec failed"
+            fi
+            tarball="$(find "$work" -maxdepth 1 -name '*.tgz' | head -n 1)"
+            validate_storage_archive "$tarball"
+            mkdir "$work/x"
+            tar -xzf "$tarball" -C "$work/x"
+            root="$work/x/package"
+            resolved="$(sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' "$root/package.json" | head -n 1)"
+            ;;
+        *)
+            command_exists git || { rm -rf "$work"; die "git is required for $source"; }
+            root="$work/repo"
+            git init -q "$root"
+            if git -C "$root" fetch -q --depth 1 "$source" "${ref:-HEAD}" 2>/dev/null; then
+                git -C "$root" checkout -q FETCH_HEAD
+            else
+                # Some servers refuse a bare commit in a shallow fetch: take it all.
+                rm -rf "$root"
+                if ! git clone -q "$source" "$root" \
+                    || { [ -n "$ref" ] && ! git -C "$root" checkout -q "$ref"; }; then
+                    rm -rf "$work"
+                    die "could not fetch ${ref:-HEAD} of $source"
+                fi
+            fi
+            resolved="$(git -C "$root" rev-parse HEAD)"
+            ;;
+    esac
+    if [ ! -f "$root/$path/SKILL.md" ]; then
+        rm -rf "$work"
+        die "no SKILL.md at '$path' in $source"
+    fi
+    if [ -n "$(find "$root/$path" -type l -not -path '*/.git/*' | head -n 1)" ]; then
+        rm -rf "$work"
+        die "refusing to vendor a skill containing symlinks ($source $path)"
+    fi
+    mkdir -p "$dest"
+    ( cd "$root/$path" && tar -cf - --exclude=.git . ) | ( cd "$dest" && tar -xf - )
+    rm -rf "$work"
+    printf '%s\n' "$resolved"
+}
+
+write_upstream() {
+    {
+        echo "# Where this skill comes from. Managed by agent-sync skill add/update."
+        echo "source=$2"
+        echo "path=$3"
+        echo "ref=$4"
+        echo "updated=$(date '+%Y-%m-%d')"
+    } > "$1/$SKILL_UPSTREAM_FILE"
+}
+
+skill_list() {
+    local up found=false
+    for up in "$REPO_DIR"/skills/*/"$SKILL_UPSTREAM_FILE"; do
+        [ -f "$up" ] || continue
+        found=true
+        printf '%-24s %s %s @ %s (%s)\n' "$(basename "$(dirname "$up")")" \
+            "$(upstream_value "$up" source)" "$(upstream_value "$up" path)" \
+            "$(upstream_value "$up" ref)" "$(upstream_value "$up" updated)"
+    done
+    [ "$found" = true ] || echo "No vendored skills (no skills/*/$SKILL_UPSTREAM_FILE)."
+}
+
+skill_add() {
+    local name="$1" source="$2" path="${3:-.}" ref="${4:-}" dir tmp resolved
+    dir="$(skill_dir_for "$name")"
+    [ -e "$dir" ] && die "skills/$name already exists (to move it: agent-sync skill update $name)"
+    tmp="$(mktemp -d)"
+    resolved="$(fetch_skill_source "$source" "$path" "$ref" "$tmp/new")" || { rm -rf "$tmp"; exit 1; }
+    mkdir -p "$REPO_DIR/skills"
+    mv "$tmp/new" "$dir"
+    rm -rf "$tmp"
+    write_upstream "$dir" "$source" "$path" "$resolved"
+    echo "Vendored $source ($path @ $resolved) into skills/$name"
+}
+
+skill_origin() {
+    local dir="$1" up
+    up="$dir/$SKILL_UPSTREAM_FILE"
+    [ -f "$up" ] || die "$(basename "$dir") is not vendored (no $SKILL_UPSTREAM_FILE)"
+    SKILL_SOURCE="$(upstream_value "$up" source)"
+    SKILL_PATH="$(upstream_value "$up" path)"
+    SKILL_REF="$(upstream_value "$up" ref)"
+    if [ -z "$SKILL_SOURCE" ] || [ -z "$SKILL_REF" ]; then
+        die "$up lacks source or ref"
+    fi
+}
+
+skill_diff() {
+    local dir tmp
+    dir="$(skill_dir_for "$1")"
+    skill_origin "$dir"
+    tmp="$(mktemp -d)"
+    fetch_skill_source "$SKILL_SOURCE" "${SKILL_PATH:-.}" "$SKILL_REF" "$tmp/upstream" >/dev/null \
+        || { rm -rf "$tmp"; exit 1; }
+    ( cd "$tmp" && diff -ruN -x "$SKILL_UPSTREAM_FILE" -x __pycache__ -x .DS_Store \
+        upstream "$dir" ) || true
+    rm -rf "$tmp"
+}
+
+skill_update() {
+    local name="$1" want="${2:-}" dir tmp new rel b o t conflicts=0 empty
+    dir="$(skill_dir_for "$name")"
+    skill_origin "$dir"
+    tmp="$(mktemp -d)"
+    fetch_skill_source "$SKILL_SOURCE" "${SKILL_PATH:-.}" "$SKILL_REF" "$tmp/base" >/dev/null \
+        || { rm -rf "$tmp"; exit 1; }
+    new="$(fetch_skill_source "$SKILL_SOURCE" "${SKILL_PATH:-.}" "$want" "$tmp/new")" \
+        || { rm -rf "$tmp"; exit 1; }
+    if [ "$new" = "$SKILL_REF" ]; then
+        rm -rf "$tmp"
+        echo "skills/$name is already at $new"
+        return 0
+    fi
+    empty="$tmp/empty"
+    : > "$empty"
+    while IFS= read -r rel; do
+        rel="${rel#./}"
+        b="$tmp/base/$rel"
+        o="$dir/$rel"
+        t="$tmp/new/$rel"
+        if [ ! -e "$o" ]; then
+            if [ ! -e "$b" ]; then
+                mkdir -p "$(dirname "$o")"
+                cp -p "$t" "$o"
+            elif ! cmp -s "$b" "$t"; then
+                echo "CONFLICT $rel: removed here, changed upstream"
+                conflicts=$((conflicts + 1))
+            fi
+        elif [ ! -e "$b" ]; then
+            if ! cmp -s "$o" "$t" && ! git merge-file -L ours -L base -L upstream "$o" "$empty" "$t"; then
+                echo "CONFLICT $rel: added on both sides"
+                conflicts=$((conflicts + 1))
+            fi
+        elif cmp -s "$o" "$b"; then
+            cp -p "$t" "$o"
+        elif ! cmp -s "$b" "$t"; then
+            if ! git merge-file -L ours -L "upstream $SKILL_REF" -L "upstream $new" "$o" "$b" "$t"; then
+                echo "CONFLICT $rel: changed here and upstream"
+                conflicts=$((conflicts + 1))
+            fi
+        fi
+    done < <(cd "$tmp/new" && find . -type f | sort)
+    while IFS= read -r rel; do
+        rel="${rel#./}"
+        [ -e "$tmp/new/$rel" ] && continue
+        o="$dir/$rel"
+        [ -e "$o" ] || continue
+        if cmp -s "$o" "$tmp/base/$rel"; then
+            rm -f "$o"
+        else
+            echo "CONFLICT $rel: changed here, removed upstream"
+            conflicts=$((conflicts + 1))
+        fi
+    done < <(cd "$tmp/base" && find . -type f | sort)
+    rm -rf "$tmp"
+    write_upstream "$dir" "$SKILL_SOURCE" "${SKILL_PATH:-.}" "$new"
+    echo "skills/$name: $SKILL_REF -> $new"
+    if [ "$conflicts" -gt 0 ]; then
+        echo "$conflicts conflict(s): resolve them in $dir (markers <<<<<<< / >>>>>>>), then agent-sync sync." >&2
+        exit 1
+    fi
+    echo "Review with: git -C \"$REPO_DIR\" diff -- skills/$name   then: agent-sync sync"
+}
+
+do_skill() {
+    shift
+    local sub="${1:-list}"
+    [ $# -gt 0 ] && shift
+    case "$sub" in
+        list)
+            skill_list
+            ;;
+        add)
+            [ $# -ge 2 ] || die "usage: agent-sync skill add <name> <source> [path] [ref]"
+            skill_add "$@"
+            ;;
+        diff)
+            [ $# -ge 1 ] || die "usage: agent-sync skill diff <name>"
+            skill_diff "$1"
+            ;;
+        update)
+            [ $# -ge 1 ] || die "usage: agent-sync skill update <name> [ref]"
+            skill_update "$1" "${2:-}"
+            ;;
+        *)
+            die "unknown skill command '$sub' (expected list, add, diff, or update)"
+            ;;
+    esac
+}
+
 print_usage() {
     cat <<'USAGE'
 Usage: agent-sync [-p PREFIX] [-w WORKDIR] [-a AGENTS] <command>
@@ -1484,6 +1719,9 @@ Commands:
                 LOCAL:CANONICAL for an explicit mapping)
   instructions install/remove/status the managed block in instructions.md
   env          install/remove/status/print managed shell env block
+  skill        vendored skills: list | add <name> <source> [path] [ref] |
+               diff <name> | update <name> [ref]
+               (source = a git URL or npm:<package>; see README)
   unlink       remove data-directory-owned symlinks
   clean        remove broken project memory symlinks
   status       show data directory, backend, projects, link health, and changes
@@ -1556,6 +1794,9 @@ case "$ACTION" in
         ;;
     env)
         do_env "${ARG1:-status}"
+        ;;
+    skill|skills)
+        do_skill "${ARGS[@]}"
         ;;
     unlink|uninstall)
         do_unlink
