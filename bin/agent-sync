@@ -6,7 +6,7 @@
 #   • Your config lives in a private local data directory.
 #     Point AGENT_SYNC_DIR at it, then choose a sync backend.
 #
-# One data directory feeds several agents (Claude Code, tclaude, Codex).
+# One data directory feeds several agents (Claude Code, Codex).
 # Each agent declares where its home is and which assets it accepts;
 # see the "agent registry" section.
 #
@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-KNOWN_AGENTS="claude tclaude codex"
+KNOWN_AGENTS="claude codex"
 DEFAULT_AGENTS="claude"
 
 REMOTE="${AGENT_SYNC_REMOTE:-origin}"
@@ -43,7 +43,6 @@ die() {
 agent_home() {
     case "$1" in
         claude)  printf '%s\n' "$HOME/.claude" ;;
-        tclaude) printf '%s\n' "$HOME/.tclaude" ;;
         codex)   printf '%s\n' "$HOME/.codex" ;;
         *)       die "unknown agent '$1' (known: $KNOWN_AGENTS)" ;;
     esac
@@ -70,13 +69,13 @@ asset_source() {
 # has no per-project memory store. Only what genuinely maps is mapped.
 agent_asset() {
     case "$1:$2" in
-        claude:instructions|tclaude:instructions)  printf '%s\n' "CLAUDE.md" ;;
+        claude:instructions)  printf '%s\n' "CLAUDE.md" ;;
         codex:instructions)                        printf '%s\n' "AGENTS.md" ;;
-        claude:settings|tclaude:settings)          printf '%s\n' "settings.json" ;;
-        claude:keybindings|tclaude:keybindings)    printf '%s\n' "keybindings.json" ;;
-        claude:skills|tclaude:skills|codex:skills) printf '%s\n' "skills" ;;
-        claude:mcp-servers|tclaude:mcp-servers)    printf '%s\n' "mcp-servers" ;;
-        claude:projects|tclaude:projects)          printf '%s\n' "projects" ;;
+        claude:settings)          printf '%s\n' "settings.json" ;;
+        claude:keybindings)    printf '%s\n' "keybindings.json" ;;
+        claude:skills|codex:skills) printf '%s\n' "skills" ;;
+        claude:mcp-servers)    printf '%s\n' "mcp-servers" ;;
+        claude:projects)          printf '%s\n' "projects" ;;
         *)                                         printf '%s\n' "" ;;
     esac
 }
@@ -84,7 +83,6 @@ agent_asset() {
 agent_detected() {
     case "$1" in
         claude)  command_exists claude  || [ -d "$HOME/.claude" ] ;;
-        tclaude) command_exists tclaude || [ -d "$HOME/.tclaude" ] ;;
         codex)   command_exists codex   || [ -d "$HOME/.codex" ] ;;
         *)       return 1 ;;
     esac
@@ -332,6 +330,7 @@ synced_data_paths() {
         .gitignore \
         .agent-sync-data \
         .agent-sync-projects \
+        .agent-sync-skills \
         README.md \
         settings.json \
         instructions.md \
@@ -612,7 +611,7 @@ write_project_mapping() {
 
 # Map one device-local project name onto a canonical one, for every enabled
 # agent that keeps per-project memory. The mapping file itself is shared:
-# Claude Code and tclaude use the identical path-derived naming scheme.
+# Claude Code uses path-derived project names.
 apply_project_mapping() {
     local local_name="$1" canonical="$2" agent local_mem canonical_mem
     validate_project_name "$local_name"
@@ -631,12 +630,41 @@ apply_project_mapping() {
     write_project_mapping "$local_name" "$canonical"
 }
 
+# Explicit per-skill harness allowlists. Unlisted skills keep the normal agent mapping.
+validate_skill_rules() {
+    local name targets extra seen=" " agent
+    [ -f "$REPO_DIR/.agent-sync-skills" ] || return 0
+    while read -r name targets extra || [ -n "$name" ]; do
+        case "$name" in ""|\#*) continue ;; esac
+        case "$name" in *[!a-zA-Z0-9._-]*|.|..) die "invalid skill name in .agent-sync-skills: $name" ;; esac
+        if [ -z "$targets" ] || [ -n "$extra" ]; then
+            die "skill rule needs a name and harness list: $name"
+        fi
+        case "$seen" in *" $name "*) die "duplicate skill rule: $name" ;; esac
+        seen="$seen$name "
+        case "$targets" in
+            all|none) continue ;;
+            ,*|*,|*,,*) die "invalid skill harness list: $targets" ;;
+        esac
+        for agent in $(printf '%s' "$targets" | tr ',' ' '); do
+            case " $KNOWN_AGENTS " in *" $agent "*) ;; *) die "unknown skill harness: $agent" ;; esac
+        done
+    done < "$REPO_DIR/.agent-sync-skills"
+}
+
+skill_allowed() {
+    local targets
+    targets="$(awk -v skill="$1" '$1 == skill { print $2 }' "$REPO_DIR/.agent-sync-skills" 2>/dev/null || true)"
+    case "$targets" in ""|all) return 0 ;; none) return 1 ;; esac
+    case ",$targets," in *",$2,"*) return 0 ;; *) return 1 ;; esac
+}
+
 # Link each direct child of src_dir into dest_dir as its own symlink. Entries
 # the data directory does not own (vendor-shipped skills, a device-local
 # .venv) are left in place; links to entries that have since been removed from
 # the data directory are pruned.
 link_children() {
-    local src_dir="$1" dest_dir="$2" exclude="${3:-}"
+    local src_dir="$1" dest_dir="$2" exclude="${3:-}" harness="${4:-}"
     local inner inner_name dest
     # A whole-directory symlink (from an older layout) would shadow the
     # per-entry links; replace it with a real directory.
@@ -648,6 +676,13 @@ link_children() {
         [ -e "$inner" ] || [ -L "$inner" ] || continue
         inner_name="$(basename "$inner")"
         if [ -n "$exclude" ] && [ "$inner_name" = "$exclude" ]; then
+            continue
+        fi
+        if [ -n "$harness" ] && ! skill_allowed "$inner_name" "$harness"; then
+            # Remove only our exact link. A native/plugin skill or local copy is untouched.
+            if [ -L "$dest_dir/$inner_name" ] && [ "$(readlink "$dest_dir/$inner_name")" = "$inner" ]; then
+                rm -f "$dest_dir/$inner_name"
+            fi
             continue
         fi
         make_link "$inner" "$dest_dir/$inner_name"
@@ -696,7 +731,7 @@ link_agent_configs() {
         # Per-skill links, not a directory symlink: agents ship their own
         # skills into this directory (Codex has skills/.system/) and a
         # whole-directory link would hide them.
-        link_children "$src" "$AGENT_HOME/$rel"
+        link_children "$src" "$AGENT_HOME/$rel" "" "$AGENT_NAME"
         echo "  linked skills/"
     fi
 
@@ -1340,6 +1375,7 @@ write_data_repo_scaffold() {
 !.gitignore
 !.agent-sync-data
 !.agent-sync-projects
+!.agent-sync-skills
 !README.md
 
 # Top-level config
@@ -1740,7 +1776,6 @@ Options:
 
 Agents:
   claude    ~/.claude    instructions settings keybindings skills mcp-servers projects
-  tclaude   ~/.tclaude   instructions settings keybindings skills mcp-servers projects
   codex     ~/.codex     instructions skills
 
   Codex keeps its settings in config.toml. Its native memories are generated
@@ -1781,6 +1816,7 @@ case "$ACTION" in
 esac
 
 REPO_DIR="$(resolve_repo_dir)"
+validate_skill_rules
 
 case "$ACTION" in
     link)

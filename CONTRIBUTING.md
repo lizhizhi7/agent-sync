@@ -17,6 +17,6 @@ The GitHub Actions workflow runs ShellCheck and the test suite on pull requests.
 ## Safety Notes
 
 - Do not commit real agent config, project memory, credentials, or local machine paths.
-- Test with a temporary `HOME`; never point tests at your real `~/.claude`, `~/.tclaude`, or `~/.codex`.
+- Test with a temporary `HOME`; never point tests at your real `~/.claude` or `~/.codex`.
 - Prefer no-clobber copies and backups before replacing local files.
 - Keep new synced paths explicit in the allowlist-style `.gitignore`.
