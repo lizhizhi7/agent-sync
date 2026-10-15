@@ -526,14 +526,11 @@ test_links_multiple_agents_from_one_data_dir() {
     printf 'memory\n' > "$data/projects/-app/memory/note.md"
 
     HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local \
-        AGENT_SYNC_AGENTS=claude,tclaude,codex agent_sync link >/dev/null
+        AGENT_SYNC_AGENTS=claude,codex agent_sync link >/dev/null
 
-    # Claude Code and tclaude take the full asset set, sharing one settings.json.
+    # Claude Code receives settings and native project memories.
     assert_symlink_to "$home/.claude/settings.json" "$data/settings.json"
-    assert_symlink_to "$home/.tclaude/settings.json" "$data/settings.json"
     assert_symlink_to "$home/.claude/CLAUDE.md" "$data/instructions.md"
-    assert_symlink_to "$home/.tclaude/CLAUDE.md" "$data/instructions.md"
-    assert_symlink_to "$home/.tclaude/projects/$prefix-app/memory" "$data/projects/-app/memory"
 
     # Codex takes only what genuinely maps: instructions under its own name, plus skills.
     assert_symlink_to "$home/.codex/AGENTS.md" "$data/instructions.md"
@@ -548,16 +545,16 @@ test_link_leaves_disabled_agents_untouched() {
     tmp="$(new_tmp)"
     home="$tmp/home"
     data="$tmp/data"
-    mkdir -p "$home/.tclaude" "$data"
+    mkdir -p "$home/.codex" "$data"
     touch "$data/.agent-sync-data"
     printf '{"shared":true}\n' > "$data/settings.json"
-    printf '{"device":true}\n' > "$home/.tclaude/settings.json"
+    printf '{"device":true}\n' > "$home/.codex/settings.json"
 
     HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local agent_sync link >/dev/null
 
     assert_symlink_to "$home/.claude/settings.json" "$data/settings.json"
-    [ ! -L "$home/.tclaude/settings.json" ] || { echo "disabled agent was linked" >&2; exit 1; }
-    grep -Fqx '{"device":true}' "$home/.tclaude/settings.json" || { echo "disabled agent config was modified" >&2; exit 1; }
+    [ ! -L "$home/.codex/settings.json" ] || { echo "disabled agent was linked" >&2; exit 1; }
+    grep -Fqx '{"device":true}' "$home/.codex/settings.json" || { echo "disabled agent config was modified" >&2; exit 1; }
 }
 
 test_unlink_only_touches_enabled_agents() {
@@ -565,19 +562,20 @@ test_unlink_only_touches_enabled_agents() {
     tmp="$(new_tmp)"
     home="$tmp/home"
     data="$tmp/data"
-    mkdir -p "$home/.claude" "$home/.tclaude" "$data"
+    mkdir -p "$home/.claude" "$home/.codex" "$data"
     touch "$data/.agent-sync-data"
-    printf '{}\n' > "$data/settings.json"
-    ln -s "$data/settings.json" "$home/.claude/settings.json"
-    ln -s "$data/settings.json" "$home/.tclaude/settings.json"
+    printf '{}\n' > "$data/instructions.md"
+    ln -s "$data/instructions.md" "$home/.claude/CLAUDE.md"
+    ln -s "$data/instructions.md" "$home/.codex/AGENTS.md"
 
     HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local agent_sync unlink >/dev/null
 
-    [ ! -e "$home/.claude/settings.json" ] || { echo "enabled agent link was not removed" >&2; exit 1; }
-    assert_symlink_to "$home/.tclaude/settings.json" "$data/settings.json"
+    [ ! -e "$home/.claude/CLAUDE.md" ] || { echo "enabled agent link was not removed" >&2; exit 1; }
 
-    HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local AGENT_SYNC_AGENTS=tclaude agent_sync unlink >/dev/null
-    [ ! -e "$home/.tclaude/settings.json" ] || { echo "explicit agent link was not removed" >&2; exit 1; }
+    assert_symlink_to "$home/.codex/AGENTS.md" "$data/instructions.md"
+
+    HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local AGENT_SYNC_AGENTS=codex agent_sync unlink >/dev/null
+    [ ! -e "$home/.codex/AGENTS.md" ] || { echo "explicit agent link was not removed" >&2; exit 1; }
 }
 
 test_rejects_unknown_agent() {
@@ -675,6 +673,32 @@ test_skill_vendor_update_keeps_local_edits() {
     grep -q '^<<<<<<< ours' "$data/skills/s/SKILL.md" || { echo "no conflict markers" >&2; exit 1; }
 }
 
+test_harness_skill_rules() {
+    local tmp home data
+    tmp="$(new_tmp)"; home="$tmp/home"; data="$tmp/data"
+    mkdir -p "$home" "$data/skills/frontend-design" "$data/skills/shared"
+    touch "$data/.agent-sync-data" "$data/skills/frontend-design/SKILL.md" "$data/skills/shared/SKILL.md"
+    HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local AGENT_SYNC_AGENTS=claude,codex agent_sync link >/dev/null
+    printf 'frontend-design codex\n' > "$data/.agent-sync-skills"
+    HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local AGENT_SYNC_AGENTS=claude,codex agent_sync link >/dev/null
+    [ ! -L "$home/.claude/skills/frontend-design" ] || exit 1
+    assert_symlink_to "$home/.codex/skills/frontend-design" "$data/skills/frontend-design"
+    assert_symlink_to "$home/.claude/skills/shared" "$data/skills/shared"
+    mkdir -p "$home/.claude/skills/frontend-design"
+    printf 'native skill\n' > "$home/.claude/skills/frontend-design/SKILL.md"
+    HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local AGENT_SYNC_AGENTS=claude,codex agent_sync link >/dev/null
+    grep -qx 'native skill' "$home/.claude/skills/frontend-design/SKILL.md" || exit 1
+    printf 'frontend-design none\n' > "$data/.agent-sync-skills"
+    HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local AGENT_SYNC_AGENTS=claude,codex agent_sync link >/dev/null
+    [ ! -L "$home/.codex/skills/frontend-design" ] || exit 1
+    printf 'shared tclaude\n' > "$data/.agent-sync-skills"
+    if HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local agent_sync link >/dev/null 2>&1; then exit 1; fi
+    printf 'shared codex\nshared claude\n' > "$data/.agent-sync-skills"
+    if HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local agent_sync link >/dev/null 2>&1; then exit 1; fi
+    rm "$data/.agent-sync-skills"
+    if HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local AGENT_SYNC_AGENTS=tclaude agent_sync link >/dev/null 2>&1; then exit 1; fi
+}
+
 run_test "init supports local backend" test_init_local_backend
 run_test "link backs up existing config before symlink" test_link_backs_up_existing_config
 run_test "project memory migration includes dotfiles" test_migrates_dotfiles_in_project_memory
@@ -700,5 +724,7 @@ run_test "unlink only touches enabled agents" test_unlink_only_touches_enabled_a
 run_test "unknown agent names are rejected" test_rejects_unknown_agent
 run_test "unlink --env removes managed env block" test_unlink_env_removes_managed_env_block
 run_test "skill update merges upstream and keeps local edits" test_skill_vendor_update_keeps_local_edits
+
+run_test "harness skill rules preserve native skills and reject removed harnesses" test_harness_skill_rules
 
 printf 'ok: %s tests passed\n' "$pass_count"

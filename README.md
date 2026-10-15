@@ -11,7 +11,6 @@ One data directory feeds several agents. Each agent declares where its home is a
 | Agent | Home | Instructions | Settings | Keybindings | Skills | MCP servers | Project memory |
 |---|---|---|---|---|---|---|---|
 | `claude` | `~/.claude` | `CLAUDE.md` | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `tclaude` | `~/.tclaude` | `CLAUDE.md` | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `codex` | `~/.codex` | `AGENTS.md` | — | — | ✅ | — | via `agent-sync memory` |
 
 Codex keeps its settings in `config.toml` (TOML, and MCP servers are registered inside that same file rather than as a directory). Its native `~/.codex/memories/` content is generated state rather than a curated project-memory interface, so `agent-sync` leaves it device-local. The shared instruction block tells Codex to load the canonical curated memory through `agent-sync memory` instead.
@@ -19,7 +18,7 @@ Codex keeps its settings in `config.toml` (TOML, and MCP servers are registered 
 Only `claude` is enabled by default. Opt the others in explicitly — linking your global instructions into another agent's home changes that agent's behavior in every session, so it is never done on autodetection alone:
 
 ```bash
-export AGENT_SYNC_AGENTS=claude,tclaude,codex
+export AGENT_SYNC_AGENTS=claude,codex
 agent-sync link
 ```
 
@@ -49,11 +48,9 @@ The data directory holds one agent-neutral copy of each asset. It is linked into
 | `projects/*/memory/` | Yes |
 | Conversation logs, cache, sessions, telemetry | No |
 
-Claude Code and tclaude share one `settings.json`. If they ever need to diverge, give each its own file rather than adding a merge layer.
-
 ## How It Works
 
-Claude Code and tclaude derive project directory names from absolute paths:
+Claude Code derives project directory names from absolute paths:
 
 ```text
 ~/.claude/projects/-Users-alice-dev-myapp/       # macOS
@@ -67,7 +64,7 @@ $AGENT_SYNC_DIR/projects/-myapp/memory/
 ~/.claude/projects/-Users-alice-dev-myapp/memory -> $AGENT_SYNC_DIR/projects/-myapp/memory
 ```
 
-Both agents use the identical naming scheme, so one mapping file covers both.
+Project mappings connect device-specific names to the shared store.
 
 Codex loads required guidance through `AGENTS.md`. Because the shared project memories may be much larger than Codex's instruction-file budget, `agent-sync` does not copy them into the global file or into Codex's generated memory store. Instead, run this inside a repository:
 
@@ -93,6 +90,27 @@ Each line maps a local project directory name to a canonical synced project:
 ```
 
 `agent-sync link` honors those mappings before using the default prefix-based project name.
+
+## Skills by harness
+
+Put optional harness allowlists in the data directory's `.agent-sync-skills` file:
+
+```text
+# skill-directory    harnesses
+frontend-design      codex
+shared-helper        all
+retired-helper       none
+```
+
+Each non-comment line names one direct child of `skills/` and either a comma-separated
+list of supported agents, `all`, or `none`. Unlisted skills link to every enabled harness
+that supports skills. Duplicate names, unknown harnesses, and malformed rules fail before
+linking. Rules sync through both git and object-storage backends.
+
+Run `agent-sync link` after editing. Excluding a skill removes only the exact link to that
+shared skill; native/plugin skills and local copies remain untouched. This lets Claude Code
+use its installed `frontend-design` while Codex receives the shared copy. Removed harnesses
+are rejected rather than silently accepted; tClaude is no longer supported.
 
 ## Install
 
@@ -289,7 +307,7 @@ directory (often `config.json`); ignore that path in the data directory's
 | Env var | Meaning |
 |---|---|
 | `AGENT_SYNC_DIR` | Private local data directory. Required except for `init` and `help`. |
-| `AGENT_SYNC_AGENTS` | Comma-separated agents to link: `claude`, `tclaude`, `codex`. Default: `claude`. |
+| `AGENT_SYNC_AGENTS` | Comma-separated agents to link: `claude`, `codex`. Default: `claude`. |
 | `AGENT_SYNC_BACKEND` | `git`, `s3`, `gcs`, or `local`. Default: `git`. |
 | `AGENT_SYNC_STORAGE_URI` | `s3://bucket/prefix` or `gs://bucket/prefix` for object storage. |
 | `AGENT_SYNC_STORAGE_OBJECT` | Archive object name. Default: `agent-sync-data.tar.gz`. |
