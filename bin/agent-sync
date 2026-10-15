@@ -637,7 +637,9 @@ validate_skill_rules() {
     while read -r name targets extra || [ -n "$name" ]; do
         case "$name" in ""|\#*) continue ;; esac
         case "$name" in *[!a-zA-Z0-9._-]*|.|..) die "invalid skill name in .agent-sync-skills: $name" ;; esac
-        [ -n "$targets" ] && [ -z "$extra" ] || die "skill rule needs a name and harness list: $name"
+        if [ -z "$targets" ] || [ -n "$extra" ]; then
+            die "skill rule needs a name and harness list: $name"
+        fi
         case "$seen" in *" $name "*) die "duplicate skill rule: $name" ;; esac
         seen="$seen$name "
         case "$targets" in
