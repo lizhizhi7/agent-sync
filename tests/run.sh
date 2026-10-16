@@ -699,6 +699,31 @@ test_harness_skill_rules() {
     if HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local AGENT_SYNC_AGENTS=tclaude agent_sync link >/dev/null 2>&1; then exit 1; fi
 }
 
+test_opencode_and_pi() {
+    local tmp home data target
+    tmp="$(new_tmp)"; home="$tmp/home"; data="$tmp/data"
+    mkdir -p "$home/.config/opencode" "$home/.pi/agent" "$data/skills/shared"
+    touch "$data/.agent-sync-data" "$data/skills/shared/SKILL.md"
+    printf 'guidance\n' > "$data/instructions.md"
+    printf 'native settings\n' > "$home/.config/opencode/opencode.json"
+    printf 'private auth\n' > "$home/.pi/agent/auth.json"
+    HOME="$home" XDG_CONFIG_HOME="$home/.config" OPENCODE_CONFIG_DIR='' PI_CODING_AGENT_DIR='' AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local agent_sync -a opencode,pi link >/dev/null
+    for target in "$home/.config/opencode" "$home/.pi/agent"; do
+        assert_symlink_to "$target/AGENTS.md" "$data/instructions.md"
+        assert_symlink_to "$target/skills/shared" "$data/skills/shared"
+    done
+    grep -qx 'native settings' "$home/.config/opencode/opencode.json" || exit 1
+    grep -qx 'private auth' "$home/.pi/agent/auth.json" || exit 1
+    printf 'shared pi\n' > "$data/.agent-sync-skills"
+    HOME="$home" XDG_CONFIG_HOME="$home/.config" OPENCODE_CONFIG_DIR='' PI_CODING_AGENT_DIR='' AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local agent_sync -a opencode,pi link >/dev/null
+    [ ! -L "$home/.config/opencode/skills/shared" ] || exit 1
+    assert_symlink_to "$home/.pi/agent/skills/shared" "$data/skills/shared"
+    HOME="$home" OPENCODE_CONFIG_DIR="$home/custom-oc" PI_CODING_AGENT_DIR="$home/custom-pi" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local agent_sync -a opencode,pi link >/dev/null
+    assert_symlink_to "$home/custom-oc/AGENTS.md" "$data/instructions.md"
+    assert_symlink_to "$home/custom-pi/skills/shared" "$data/skills/shared"
+}
+
+run_test "OpenCode and Pi link only supported assets and honor custom homes" test_opencode_and_pi
 run_test "init supports local backend" test_init_local_backend
 run_test "link backs up existing config before symlink" test_link_backs_up_existing_config
 run_test "project memory migration includes dotfiles" test_migrates_dotfiles_in_project_memory

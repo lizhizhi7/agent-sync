@@ -6,7 +6,7 @@
 #   • Your config lives in a private local data directory.
 #     Point AGENT_SYNC_DIR at it, then choose a sync backend.
 #
-# One data directory feeds several agents (Claude Code, Codex).
+# One data directory feeds several agents (Claude Code, Codex, OpenCode, Pi).
 # Each agent declares where its home is and which assets it accepts;
 # see the "agent registry" section.
 #
@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-KNOWN_AGENTS="claude codex"
+KNOWN_AGENTS="claude codex opencode pi"
 DEFAULT_AGENTS="claude"
 
 REMOTE="${AGENT_SYNC_REMOTE:-origin}"
@@ -44,6 +44,8 @@ agent_home() {
     case "$1" in
         claude)  printf '%s\n' "$HOME/.claude" ;;
         codex)   printf '%s\n' "$HOME/.codex" ;;
+        opencode) printf '%s\n' "${OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}" ;;
+        pi)      printf '%s\n' "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}" ;;
         *)       die "unknown agent '$1' (known: $KNOWN_AGENTS)" ;;
     esac
 }
@@ -70,10 +72,10 @@ asset_source() {
 agent_asset() {
     case "$1:$2" in
         claude:instructions)  printf '%s\n' "CLAUDE.md" ;;
-        codex:instructions)                        printf '%s\n' "AGENTS.md" ;;
+        opencode:instructions|pi:instructions|codex:instructions)                        printf '%s\n' "AGENTS.md" ;;
         claude:settings)          printf '%s\n' "settings.json" ;;
         claude:keybindings)    printf '%s\n' "keybindings.json" ;;
-        claude:skills|codex:skills) printf '%s\n' "skills" ;;
+        claude:skills|codex:skills|opencode:skills|pi:skills) printf '%s\n' "skills" ;;
         claude:mcp-servers)    printf '%s\n' "mcp-servers" ;;
         claude:projects)          printf '%s\n' "projects" ;;
         *)                                         printf '%s\n' "" ;;
@@ -84,6 +86,8 @@ agent_detected() {
     case "$1" in
         claude)  command_exists claude  || [ -d "$HOME/.claude" ] ;;
         codex)   command_exists codex   || [ -d "$HOME/.codex" ] ;;
+        opencode) command_exists opencode || [ -d "$(agent_home opencode)" ] ;;
+        pi)      command_exists pi      || [ -d "$(agent_home pi)" ] ;;
         *)       return 1 ;;
     esac
 }
@@ -1777,6 +1781,8 @@ Options:
 Agents:
   claude    ~/.claude    instructions settings keybindings skills mcp-servers projects
   codex     ~/.codex     instructions skills
+  opencode  ~/.config/opencode  instructions skills
+  pi        ~/.pi/agent   instructions skills
 
   Codex keeps its settings in config.toml. Its native memories are generated
   state, so curated project memory is exposed through `agent-sync memory`
