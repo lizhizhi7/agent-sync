@@ -91,6 +91,19 @@ Each line maps a local project directory name to a canonical synced project:
 
 `agent-sync link` honors those mappings before using the default prefix-based project name.
 
+## OpenCode and Pi
+
+Enable them with `-a claude,codex,opencode,pi`. OpenCode receives `AGENTS.md` and per-entry
+skills in its global configuration directory; Pi receives the same assets in its agent
+directory. Native settings, authentication, MCP configuration and session files remain
+owned by each harness. Both use `agent-sync memory` for curated project memory.
+
+Home resolution follows [OpenCode configuration](https://opencode.ai/docs/config/) and
+[Pi configuration](https://github.com/earendil-works/pi-mono/tree/main/packages/coding-agent):
+OpenCode honors `OPENCODE_CONFIG_DIR`, then the XDG config root; Pi honors
+`PI_CODING_AGENT_DIR`. The registry in `bin/agent-sync` defines the actual asset mappings.
+These local links are independent of agtrace's task-container skill projection.
+
 ## Skills by harness
 
 Put optional harness allowlists in the data directory's `.agent-sync-skills` file:
@@ -105,7 +118,8 @@ retired-helper       none
 Each non-comment line names one direct child of `skills/` and either a comma-separated
 list of supported agents, `all`, or `none`. Unlisted skills link to every enabled harness
 that supports skills. Duplicate names, unknown harnesses, and malformed rules fail before
-linking. Rules sync through both git and object-storage backends.
+linking. Rules sync through both git and object-storage backends. They control agent-sync-owned links;
+a harness may additionally discover skills in its native compatibility locations.
 
 Run `agent-sync link` after editing. Excluding a skill removes only the exact link to that
 shared skill; native/plugin skills and local copies remain untouched. This lets Claude Code
