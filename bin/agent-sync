@@ -1854,6 +1854,7 @@ Commands:
                 LOCAL:CANONICAL for an explicit mapping)
   instructions install/remove/status the managed block in instructions.md
   env          install/remove/status/print managed shell env block
+  resource     lock/export selected Git resources (Python 3; see README)
   skill        vendored skills: list | add <name> <source> [path] [ref] |
                diff <name> | update <name> [ref] [--variant <variant>] |
                derive <name> <variant> <recipe-file> | accept <name> --variant <variant>
@@ -1932,6 +1933,12 @@ case "$ACTION" in
         ;;
     env)
         do_env "${ARG1:-status}"
+        ;;
+    resource)
+        command_exists python3 || die "resource exports require Python 3"
+        resource_args=("${ARGS[@]:1}")
+        if [ "${resource_args[0]:-}" = help ]; then resource_args=(--help); fi
+        python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/libexec/resources.py" "${resource_args[@]}"
         ;;
     skill|skills)
         do_skill "${ARGS[@]}"

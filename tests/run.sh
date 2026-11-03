@@ -790,4 +790,6 @@ run_test "derived skill updates require candidate validation" test_derived_skill
 
 run_test "harness skill rules preserve native skills and reject removed harnesses" test_harness_skill_rules
 
+python3 "$ROOT/tests/test_resources.py"
+
 printf 'ok: %s tests passed\n' "$pass_count"

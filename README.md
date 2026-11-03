@@ -406,3 +406,31 @@ The data directory at `$AGENT_SYNC_DIR` is left intact.
 ## License
 
 [MIT](LICENSE)
+
+### Locked resource exports
+
+`resource` is a build-time export target, separate from agent-home linking. It requires
+Python 3; the other commands remain Bash-only. A consumer such as a connector package
+provides a JSON manifest with `version: 1`, an optional Git `revision`, and a `resources`
+list. Each resource declares an export `id`, source directory `path`, and optional exact
+`exclude` paths relative to that directory. For example, select `skills/example` and
+`skill-variants/bashless/example` as two separate resources. Missing variants never fall
+back to the common procedure.
+
+```bash
+agent-sync resource lock request.json --source-dir /path/to/data --output resources.lock
+agent-sync resource export resources.lock --source-dir /path/to/data --destination candidate
+```
+
+Locking resolves the source commit and records every selected file's hash, mode and size,
+plus a digest of the complete resource. Export reads those exact Git objects, including
+provenance and supporting files, and verifies the lock. Uncommitted changes and subsequent
+syncs cannot alter the result. It neither fetches network content nor executes resource
+scripts. The source clone must already contain the locked commit.
+
+Export to a fresh candidate directory; existing destinations are never overwritten. Review
+and adopt the candidate in the consuming repository. Symlinks, submodules, traversal and
+overlapping destinations are refused; file and byte budgets bound processing. Exporting
+never links global instructions, settings, credentials, MCP registrations or unrelated
+skills. `resources.lock` accompanies the result. An upstream update or derived-variant
+acceptance does not change any consumer until its manifest is relocked and reviewed.
