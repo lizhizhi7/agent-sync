@@ -21,10 +21,11 @@ class Exports(unittest.TestCase):
             (skill/'SKILL.md').write_text('original');(skill/'reference.md').write_text('supporting')
             (skill/'.upstream').write_text('ref=original')
             git('add','.');git('commit','-qm','fixture')
+            entry=root/'installed bin'/'agent-sync';entry.parent.mkdir();entry.symlink_to(ROOT/'bin/agent-sync')
             request=root/'request.json';locked=root/'resources.lock';dest=root/'candidate'
             request.write_text(json.dumps({'version':1,'resources':[{'id':'common/demo','path':'skills/demo'}]}))
             def run(*args):
-                return subprocess.run(['/bin/bash',str(ROOT/'bin/agent-sync'),'resource',*map(str,args),'--source-dir',str(source)],capture_output=True,env={**os.environ,'HOME':str(root/'home'),'AGENT_SYNC_DIR':str(source),'AGENT_SYNC_AGENTS':'claude','AGENT_SYNC_BACKEND':'local'})
+                return subprocess.run(['/bin/bash',str(entry),'resource',*map(str,args),'--source-dir',str(source)],capture_output=True,env={**os.environ,'HOME':str(root/'home'),'AGENT_SYNC_DIR':str(source),'AGENT_SYNC_AGENTS':'claude','AGENT_SYNC_BACKEND':'local'})
             self.assertEqual(run('lock',request,'--output',locked).returncode,0)
             (skill/'reference.md').write_text('uncommitted')
             self.assertEqual(run('export',locked,'--destination',dest).returncode,0)

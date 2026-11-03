@@ -1938,7 +1938,8 @@ case "$ACTION" in
         command_exists python3 || die "resource exports require Python 3"
         resource_args=("${ARGS[@]:1}")
         if [ "${resource_args[0]:-}" = help ]; then resource_args=(--help); fi
-        python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/libexec/resources.py" "${resource_args[@]}"
+        resource_helper="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().parent.parent / "libexec/resources.py")' "${BASH_SOURCE[0]}")"
+        python3 "$resource_helper" "${resource_args[@]}"
         ;;
     skill|skills)
         do_skill "${ARGS[@]}"
