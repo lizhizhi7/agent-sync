@@ -1390,6 +1390,8 @@ write_data_repo_scaffold() {
 # Custom skills
 !skills/
 !skills/**
+!skill-variants/
+!skill-variants/**
 
 # Custom MCP servers (code only — keep .venv device-local)
 !mcp-servers/
@@ -1533,7 +1535,55 @@ skill_dir_for() {
     case "$1" in
         ""|.*|*/*) die "invalid skill name '$1'" ;;
     esac
-    printf '%s\n' "$REPO_DIR/skills/$1"
+    if [ "${SKILL_VARIANT:-common}" = common ]; then
+        printf '%s\n' "$REPO_DIR/skills/$1"
+    else
+        case "$SKILL_VARIANT" in ""|.*|*[!a-zA-Z0-9_-]*) die "invalid skill variant '$SKILL_VARIANT'" ;; esac
+        printf '%s\n' "$REPO_DIR/skill-variants/$SKILL_VARIANT/$1"
+    fi
+}
+
+skill_derive() {
+    local name="$1" variant="$2" recipe="$3" base dest
+    [ "$variant" != common ] || die "common is the original skill, not a derived variant"
+    [ -s "$recipe" ] || die "adaptation recipe must be a nonempty file: $recipe"
+    base="$(skill_dir_for "$name")"
+    [ -f "$base/SKILL.md" ] || die "no common skill $name"
+    skill_origin "$base"
+    SKILL_VARIANT="$variant"
+    dest="$(skill_dir_for "$name")"
+    [ ! -e "$dest" ] || die "variant already exists: $name/$variant"
+    mkdir -p "$(dirname "$dest")"
+    cp -R "$base" "$dest"
+    cp "$recipe" "$dest/ADAPTATION.md"
+    {
+        echo "skill=$name"
+        echo "variant=$variant"
+        echo "base_ref=$SKILL_REF"
+        echo "recipe=ADAPTATION.md"
+    } > "$dest/.derivation"
+    echo "Derived $name/$variant from $SKILL_REF. Adapt $dest; ADAPTATION.md owns the update procedure."
+}
+
+skill_accept() {
+    local dir candidate
+    [ "${SKILL_VARIANT:-common}" != common ] || die "accept requires --variant"
+    dir="$(skill_dir_for "$1")"
+    candidate="$(dirname "$dir")/.$1-update"
+    [ -f "$candidate/SKILL.md" ] || die "no update candidate for $1/$SKILL_VARIANT"
+    if grep -R -l '^<<<<<<<\|^=======\|^>>>>>>>' "$candidate" >/dev/null; then
+        die "resolve the candidate's merge conflicts before accepting it"
+    fi
+    [ -s "$candidate/ADAPTATION.md" ] || die "candidate lacks adaptation instructions"
+    # Rename in one filesystem: failed preparation never replaces the active variant.
+    [ ! -e "$dir.previous" ] || die "previous variant backup exists: $dir.previous"
+    mv "$dir" "$dir.previous"
+    if ! mv "$candidate" "$dir"; then
+        mv "$dir.previous" "$dir"
+        die "could not activate variant candidate"
+    fi
+    rm -rf "$dir.previous"
+    echo "Accepted $1/$SKILL_VARIANT; run agent-sync sync to distribute it."
 }
 
 # fetch_skill_source SOURCE PATH REF DEST
@@ -1608,8 +1658,11 @@ write_upstream() {
 }
 
 skill_list() {
-    local up found=false
-    for up in "$REPO_DIR"/skills/*/"$SKILL_UPSTREAM_FILE"; do
+    local up found=false base="$REPO_DIR/skills"
+    if [ "${SKILL_VARIANT:-common}" != common ]; then
+        base="$(dirname "$(skill_dir_for placeholder)")"
+    fi
+    for up in "$base"/*/"$SKILL_UPSTREAM_FILE"; do
         [ -f "$up" ] || continue
         found=true
         printf '%-24s %s %s @ %s (%s)\n' "$(basename "$(dirname "$up")")" \
@@ -1670,6 +1723,13 @@ skill_update() {
         echo "skills/$name is already at $new"
         return 0
     fi
+    if [ "${SKILL_VARIANT:-common}" != common ]; then
+        local candidate
+        candidate="$(dirname "$dir")/.$name-update"
+        [ ! -e "$candidate" ] || { rm -rf "$tmp"; die "update candidate already exists: $candidate"; }
+        cp -R "$dir" "$candidate"
+        dir="$candidate"
+    fi
     empty="$tmp/empty"
     : > "$empty"
     while IFS= read -r rel; do
@@ -1716,7 +1776,11 @@ skill_update() {
     echo "skills/$name: $SKILL_REF -> $new"
     if [ "$conflicts" -gt 0 ]; then
         echo "$conflicts conflict(s): resolve them in $dir (markers <<<<<<< / >>>>>>>), then agent-sync sync." >&2
-        exit 1
+        return 1
+    fi
+    if [ "${SKILL_VARIANT:-common}" != common ]; then
+        echo "Candidate only: $dir. Follow ADAPTATION.md, validate, then agent-sync skill accept $name --variant $SKILL_VARIANT"
+        return 0
     fi
     echo "Review with: git -C \"$REPO_DIR\" diff -- skills/$name   then: agent-sync sync"
 }
@@ -1725,12 +1789,27 @@ do_skill() {
     shift
     local sub="${1:-list}"
     [ $# -gt 0 ] && shift
+    SKILL_VARIANT=common
+    # An optional trailing selector keeps the original common commands unchanged.
+    local args=()
+    while [ $# -gt 0 ]; do
+        if [ "$1" = --variant ]; then
+            [ $# -ge 2 ] || die "--variant requires a name"
+            SKILL_VARIANT="$2"
+            shift 2
+        else
+            args+=("$1")
+            shift
+        fi
+    done
+    set -- "${args[@]+"${args[@]}"}"
     case "$sub" in
         list)
             skill_list
             ;;
         add)
             [ $# -ge 2 ] || die "usage: agent-sync skill add <name> <source> [path] [ref]"
+            [ "$SKILL_VARIANT" = common ] || die "use skill derive to create a variant with adaptation provenance"
             skill_add "$@"
             ;;
         diff)
@@ -1741,8 +1820,18 @@ do_skill() {
             [ $# -ge 1 ] || die "usage: agent-sync skill update <name> [ref]"
             skill_update "$1" "${2:-}"
             ;;
+        derive)
+            [ $# -eq 3 ] || die "usage: agent-sync skill derive <name> <variant> <recipe-file>"
+            [ "$SKILL_VARIANT" = common ] || die "derive takes its variant as a positional argument"
+            SKILL_VARIANT=common
+            skill_derive "$@"
+            ;;
+        accept)
+            [ $# -eq 1 ] || die "usage: agent-sync skill accept <name> --variant <variant>"
+            skill_accept "$1"
+            ;;
         *)
-            die "unknown skill command '$sub' (expected list, add, diff, or update)"
+            die "unknown skill command '$sub' (expected list, add, diff, update, derive, or accept)"
             ;;
     esac
 }
@@ -1766,7 +1855,8 @@ Commands:
   instructions install/remove/status the managed block in instructions.md
   env          install/remove/status/print managed shell env block
   skill        vendored skills: list | add <name> <source> [path] [ref] |
-               diff <name> | update <name> [ref]
+               diff <name> | update <name> [ref] [--variant <variant>] |
+               derive <name> <variant> <recipe-file> | accept <name> --variant <variant>
                (source = a git URL or npm:<package>; see README)
   unlink       remove data-directory-owned symlinks
   clean        remove broken project memory symlinks

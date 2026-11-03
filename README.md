@@ -317,6 +317,34 @@ conflict on the next update. Some skills keep a local token in their own
 directory (often `config.json`); ignore that path in the data directory's
 `.gitignore` so it never syncs.
 
+### Derived runtime variants
+
+Use a derived variant when the consumer needs a different workflow, such as a
+bashless operator that delegates code work. The original is the `common` variant.
+Variants are separate from versions and are stored under
+`skill-variants/<variant>/<name>/`; normal harness linking still uses `skills/`.
+A consumer selects its variant explicitly and must not fall back to shell instructions.
+
+```bash
+agent-sync skill derive cnb-api bashless /path/to/adaptation-instructions.md
+agent-sync skill diff cnb-api --variant bashless
+agent-sync skill update cnb-api --variant bashless
+agent-sync skill accept cnb-api --variant bashless
+```
+
+`derive` copies the current skill, including its pinned `.upstream`, and records
+the original base revision in `.derivation`. Edit the derived files for their actual
+environment. `ADAPTATION.md` records the conversion decisions, executable/tool
+compatibility and validation procedure for future maintainers. No recipe is executed.
+
+Updating a variant performs the upstream three-way merge in a hidden sibling
+candidate. The active variant remains unchanged, even when merging conflicts.
+Follow the candidate's adaptation instructions, review upstream additions, and validate
+the result before `accept`. Accept refuses conflict markers and replaces the variant;
+then run `agent-sync sync`. Existing data repositories with an allowlist `.gitignore`
+must include `!skill-variants/` and `!skill-variants/**`. Sync distributes variants;
+they are not linked into shell-agent skill directories.
+
 
 | Env var | Meaning |
 |---|---|
