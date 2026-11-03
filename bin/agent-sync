@@ -1591,7 +1591,7 @@ skill_accept() {
 # (empty = latest) into DEST, and print the exact ref it resolved to: a commit
 # for git, a version for npm.
 fetch_skill_source() {
-    local source="$1" path="$2" ref="$3" dest="$4" work root resolved tarball spec
+    local source="$1" path="$2" ref="$3" dest="$4" work root resolved tarball spec physical root_real
     work="$(mktemp -d)"
     case "$source" in
         npm:*)
@@ -1627,16 +1627,22 @@ fetch_skill_source() {
             resolved="$(git -C "$root" rev-parse HEAD)"
             ;;
     esac
-    if [ ! -f "$root/$path/SKILL.md" ]; then
+    root_real="$(cd "$root" && pwd -P)"
+    physical="$(cd "$root/$path" 2>/dev/null && pwd -P)" || { rm -rf "$work"; die "no skill directory at '$path' in $source"; }
+    case "$physical/" in
+        "$root_real/"*) ;;
+        *) rm -rf "$work"; die "skill directory alias leaves its source repository" ;;
+    esac
+    if [ ! -f "$physical/SKILL.md" ]; then
         rm -rf "$work"
         die "no SKILL.md at '$path' in $source"
     fi
-    if [ -n "$(find "$root/$path" -type l -not -path '*/.git/*' | head -n 1)" ]; then
+    if [ -n "$(find "$physical" -type l -not -path '*/.git/*' | head -n 1)" ]; then
         rm -rf "$work"
         die "refusing to vendor a skill containing symlinks ($source $path)"
     fi
     mkdir -p "$dest"
-    ( cd "$root/$path" && tar -cf - --exclude=.git . ) | ( cd "$dest" && tar -xf - )
+    ( cd "$physical" && tar -cf - --exclude=.git . ) | ( cd "$dest" && tar -xf - )
     rm -rf "$work"
     # A directory below the skill that holds its own SKILL.md is another skill (an index
     # skill at the root of a collection), vendored under its own name, never inside this one.
@@ -1938,7 +1944,8 @@ case "$ACTION" in
         command_exists python3 || die "resource exports require Python 3"
         resource_args=("${ARGS[@]:1}")
         if [ "${resource_args[0]:-}" = help ]; then resource_args=(--help); fi
-        python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/libexec/resources.py" "${resource_args[@]}"
+        resource_helper="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().parent.parent / "libexec/resources.py")' "${BASH_SOURCE[0]}")"
+        python3 "$resource_helper" "${resource_args[@]}"
         ;;
     skill|skills)
         do_skill "${ARGS[@]}"
