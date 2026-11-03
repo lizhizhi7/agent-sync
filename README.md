@@ -434,3 +434,5 @@ overlapping destinations are refused; file and byte budgets bound processing. Ex
 never links global instructions, settings, credentials, MCP registrations or unrelated
 skills. `resources.lock` accompanies the result. An upstream update or derived-variant
 acceptance does not change any consumer until its manifest is relocked and reviewed.
+
+An explicitly selected Git skill directory may be an alias to another directory inside the same checkout. Vendoring resolves and checks that boundary before reading the skill; directory aliases leaving the checkout and symlinks inside the exported bundle remain refused. This lets source repositories reorganize a skill while keeping its recorded source path usable.
