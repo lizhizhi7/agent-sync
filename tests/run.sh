@@ -748,7 +748,45 @@ run_test "link leaves disabled agents untouched" test_link_leaves_disabled_agent
 run_test "unlink only touches enabled agents" test_unlink_only_touches_enabled_agents
 run_test "unknown agent names are rejected" test_rejects_unknown_agent
 run_test "unlink --env removes managed env block" test_unlink_env_removes_managed_env_block
+test_derived_skill_update_is_a_candidate() {
+    local tmp home data up old
+    tmp="$(new_tmp)"; home="$tmp/home"; data="$tmp/data"; up="$tmp/up"
+    mkdir -p "$home" "$data/skills" "$up/pkg"
+    touch "$data/.agent-sync-data"
+    git init -q "$up"
+    printf 'one\ntwo\nthree\n' > "$up/pkg/SKILL.md"
+    git -C "$up" add .
+    git -C "$up" -c user.name=Test -c user.email=test@example.com commit -qm initial
+    HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local agent_sync skill add demo "$up" pkg >/dev/null
+    printf 'Convert shell steps to native calls; code work goes to tasks.\n' > "$tmp/recipe"
+    HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local agent_sync skill derive demo bashless "$tmp/recipe" >/dev/null
+    grep -q '^base_ref=' "$data/skill-variants/bashless/demo/.derivation"
+    assert_file "$data/skill-variants/bashless/demo/ADAPTATION.md"
+    printf 'one\ntwo adapted\nthree\n' > "$data/skill-variants/bashless/demo/SKILL.md"
+    printf 'one\ntwo upstream\nthree\n' > "$up/pkg/SKILL.md"
+    git -C "$up" add .
+    git -C "$up" -c user.name=Test -c user.email=test@example.com commit -qm update
+    old="$(cat "$data/skill-variants/bashless/demo/SKILL.md")"
+    if HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local agent_sync skill update demo --variant bashless >/dev/null 2>&1; then
+        echo 'expected candidate conflict' >&2; exit 1
+    fi
+    [ "$(cat "$data/skill-variants/bashless/demo/SKILL.md")" = "$old" ] || exit 1
+    grep -q '^<<<<<<<' "$data/skill-variants/bashless/.demo-update/SKILL.md"
+    if HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local agent_sync skill accept demo --variant bashless >/dev/null 2>&1; then
+        echo 'accepted conflicting variant' >&2; exit 1
+    fi
+    printf 'one\ntwo adapted for new provider behavior\nthree\n' > "$data/skill-variants/bashless/.demo-update/SKILL.md"
+    HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local agent_sync skill accept demo --variant bashless >/dev/null
+    grep -q 'adapted for new' "$data/skill-variants/bashless/demo/SKILL.md"
+    grep -qx 'two' "$data/skills/demo/SKILL.md"
+    HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local agent_sync link >/dev/null
+    [ ! -e "$home/.claude/skills/bashless" ] || exit 1
+    assert_symlink_to "$home/.claude/skills/demo" "$data/skills/demo"
+    if HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local agent_sync skill derive demo ../escape "$tmp/recipe" >/dev/null 2>&1; then exit 1; fi
+}
+
 run_test "skill update merges upstream and keeps local edits" test_skill_vendor_update_keeps_local_edits
+run_test "derived skill updates require candidate validation" test_derived_skill_update_is_a_candidate
 
 run_test "harness skill rules preserve native skills and reject removed harnesses" test_harness_skill_rules
 
