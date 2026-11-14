@@ -218,7 +218,7 @@ agent-sync memory bind --workspace other-team --repo myapp --access read
 agent-sync memory target --workspace agtrace
 ```
 
-Linking and binding open a personal sign-in/consent page. Verify the code shown by the CLI
+The machine API uses `/public-api/memory-sync/v2/`; the outer gateway must pass that namespace without interactive SSO. Linking and binding open a personal sign-in/consent page. Verify the code shown by the CLI
 and the exact scope before connecting. Discovery can list repository identities but cannot
 read memory; repository grants authorize one stable registration only. AgTrace rechecks
 current membership and contribution rights on every operation. Revoke a device through

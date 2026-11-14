@@ -30,6 +30,8 @@ MAX_FILE = 2_000_000
 IDENTITY = re.compile(r'^[0-9a-f]{32}$')
 
 
+PROTOCOL_PREFIX = '/public-api/memory-sync/v2'
+
 class Failure(Exception):
     pass
 
@@ -180,7 +182,7 @@ def server_origin(value):
 
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise Failure('Memory API redirected; verify --server and sign in through workspace link')
+        raise Failure('Memory API redirected. The server owner must pass '+PROTOCOL_PREFIX+'/ through the outer gateway; browser consent alone does not make this machine path reachable.')
 
 
 def request(server, path, *, token='', body=None):
@@ -191,7 +193,7 @@ def request(server, path, *, token='', body=None):
     if data is not None:
         headers['Content-Type'] = 'application/json'
     try:
-        with build_opener(NoRedirect()).open(Request(server + '/api/memory-sync/v2' + path,
+        with build_opener(NoRedirect()).open(Request(server + PROTOCOL_PREFIX + path,
                 data=data, headers=headers), timeout=30) as response:
             raw = response.read(MAX_BYTES * 3 + 1)
             if len(raw) > MAX_BYTES * 3:
@@ -434,7 +436,7 @@ def snapshot(item, credentials=None, *, offline=False):
     files=dict(cache['files']) if cache else {}
     after='';view='';since=cache.get('view','') if cache else ''
     try:
-        for page_n in range(202):
+        for page_n in range(402):
             query={k:v for k,v in {'since':since,'after':after,'view':view}.items() if v}
             value=request(item['server'],base+('?' + urlencode(query) if query else ''),token=credentials.get(item['credential_key']))
             if value.get('protocol')!=2 or value.get('id')!=item['registry_id'] or value.get('scope')!=item['workspace']:
@@ -450,11 +452,12 @@ def snapshot(item, credentials=None, *, offline=False):
                 checked_path(name)
                 if not re.fullmatch('[0-9a-f]{64}',entry.get('sha256','')):raise Failure('Memory view has an invalid body digest')
                 if not IDENTITY.fullmatch(entry.get('revision','')):raise Failure('Memory view has an invalid revision')
-                files[name]=entry
-            if len(files)>10000:raise Failure('Memory catalogue exceeds 10000 paths')
+                if entry.get('deleted'):files.pop(name,None)
+                else:files[name]=entry
+            if len(files)>20000:raise Failure('Memory catalogue exceeds 20000 active paths')
             after=value.get('next','')
             if not after:break
-        else:raise Failure('Memory catalogue exceeded 202 pages; reopen from a fresh view')
+        else:raise Failure('Memory catalogue exceeded 402 pages; reopen from a fresh view')
         value={**value,'files':files,'fetched_at':datetime.now(timezone.utc).isoformat()}
         load_bodies(item,files,credentials)
         atomic(cache_path,value)
@@ -590,6 +593,23 @@ def push(identity, credentials=None):
         return result
 
 
+def hydrate_paths(item,entries,names,credentials):
+    needed=[entries[name] for name in names if name in entries and 'content' not in entries[name] and not entries[name].get('deleted')]
+    while needed:
+        group=[];size=0
+        while needed and len(group)<32:
+            entry=needed[0];amount=entry.get('size',MAX_FILE)
+            if group and size+amount>256*1024:break
+            group.append(needed.pop(0));size+=amount
+            if size>256*1024:break
+        loaded=request(item['server'],'/registries/'+item['registry_id']+'/bodies',
+            token=credentials.get(item['credential_key']),body={'revisions':[e['revision'] for e in group]})['bodies']
+        for entry in group:
+            raw=base64.b64decode(loaded[entry['revision']]['content'],validate=True)
+            if digest(raw)!=entry['sha256']:raise Failure('Resolution body failed its pinned digest')
+            entry['content']=loaded[entry['revision']]['content']
+
+
 def resolve(identity, *, apply=False, credentials=None):
     credentials = credentials or Credentials()
     directory = session_path(identity)
@@ -602,6 +622,14 @@ def resolve(identity, *, apply=False, credentials=None):
         central, stale = snapshot(item, credentials)
         if stale:
             raise Failure('Reconnect before preparing or publishing a conflict resolution')
+        names=[change['path'] for change in pending['changes']]
+        for name in names:
+            if name not in central['files']:
+                current=request(item['server'],'/registries/'+item['registry_id']+'/snapshot?'+urlencode({'path':name}),
+                    token=credentials.get(item['credential_key']))
+                central['files'].update(current.get('files',{}))
+        hydrate_paths(item,central['files'],names,credentials)
+        hydrate_paths(item,state['files'],names,credentials)
         resolution = directory / 'resolution'
         if not apply:
             if resolution.exists():
