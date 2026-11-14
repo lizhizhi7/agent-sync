@@ -203,6 +203,98 @@ Object storage has no merge/conflict resolution. Treat one device as the active 
 
 ## Commands
 
+### AgTrace repository memory
+
+Memory can use AgTrace independently of the configuration backend. Link several workspaces,
+bind their exact repository registrations, and select a default target workspace for the current Git
+repository. Admitted bindings for the same provider identity share one repository memory root.
+Each workspace adds its own overlay. The target is a local default; changing it copies no content and never retargets an existing session.
+
+```bash
+agent-sync memory workspace link agtrace --server https://agtrace.example.com
+agent-sync memory workspace link other-team --server https://agtrace.example.com
+agent-sync memory bind --workspace agtrace --repo myapp --access write
+agent-sync memory bind --workspace other-team --repo myapp --access read
+agent-sync memory target --workspace agtrace
+```
+
+Linking and binding open a personal sign-in/consent page. Verify the code shown by the CLI
+and the exact scope before connecting. Discovery can list repository identities but cannot
+read memory; repository grants authorize one stable registration only. AgTrace rechecks
+current membership and contribution rights on every operation. Revoke a device through
+the server's `/api/me/memory-clients` page.
+
+This feature requires Python 3.10+. On macOS, tokens use the OS Keychain. On another OS,
+set `AGENT_SYNC_MEMORY_CREDENTIAL_HELPER` to an executable backed by your credential store.
+It receives `get|store <key>`, takes a stored token on stdin and returns a fetched token on
+stdout. Its diagnostics must not include credentials. Tokens never enter the synced data
+directory. `AGENT_SYNC_MEMORY_HOME` optionally selects the device-local profile, cache and
+journal directory; otherwise it uses the XDG state directory under `agent-sync/memory`.
+
+For a new project without legacy memory, explicitly activate after selecting the target workspace:
+
+```bash
+agent-sync memory activate
+agent-sync memory
+```
+
+Each open creates an isolated Markdown projection and prints its index path and session ID.
+Read that index, edit the referenced `content/` files, then publish optional durable facts:
+
+```bash
+agent-sync memory diff --session <id>
+agent-sync memory push --session <id>
+agent-sync memory status
+```
+
+The protocol fetches a paged current catalogue and only a bounded working set of bodies.
+Subsequent opens use a shared/workspace generation pair and changed heads; digest caches
+avoid refetching unchanged bodies. Unloaded files are labelled in the index. Use
+`memory load --session <id> --path <path>` to materialize a pinned document, and
+`memory inspect --session <id> --path <path> --section history` for trusted metadata.
+Markdown frontmatter has only `name`, `description`, `type` and `audience`. Set audience to
+`repository` for direct promotion of shareable edits, or `workspace` to retain private
+workspace knowledge. Unclassified edits default to workspace. Actor, workspace, task/session,
+time, evidence, versions, diffs and passage attribution belong in the service, not each header.
+
+The old `memory [directory]` form remains available. Subcommands use `--project <directory>`
+for another checkout. `memory --workspace other-team` opens a separately labelled read-only
+reference; `--write` additionally requires that registration's contribution grant. Resume
+the same projection with `memory --session <id>`. New opens and config pulls never overwrite
+an existing session. Offline opens clearly label the last complete cache as stale; authority
+denials do not fall back to cache. `memory --offline` explicitly opens that cached snapshot.
+
+Publication uses per-file expected revisions and an exact journaled request. If its response
+is lost, repeat the same push: acknowledged bytes advance while newer edits stay local. A
+workspace version conflict changes no heads. A shared promotion conflict retains the saved
+workspace proposal; review it in AgTrace and promote against the explicit current shared version. `memory resolve --session <id>` prepares `base/`, `current/` and
+editable proposed `content/`; after reviewing, use the same command with `--apply`. The
+resolution has its own journal. The original projection remains retained, including newer
+edits, and becomes read-only after a successful resolution. Reopen fresh memory and reconcile
+any later edits explicitly. Nothing concatenates or rebases conflicting facts automatically.
+
+Top-level `pull`, `push` and `sync`, when invoked in a bound repository, also route its memory
+through AgTrace. Pull refreshes only the cache. Push/sync can retry a single journaled request;
+new changes and multiple dirty sessions require an explicit session push. Unbound project memory and configuration keep their existing
+transport. No memory command publishes skills or rewrites repository instructions.
+
+**Replacing existing memory:** stop old writers and upgrade clients first. Reconcile the
+retained import base, current local files and selected central registry. Use an explicitly
+writable initial projection (`memory open --write --session new`) and publish the reviewed
+delta. Activation over existing data requires its exact source digest and a saved, clean
+session in the target workspace; `memory --help` owns those arguments. Retire the audited
+Git-tracked memory path and only its agent-sync-owned native links. Keep historical source
+and unsettled work. `.agent-sync-memory-owned` records which canonical projects have left
+the old transport: they are not remigrated, relinked or included in archives, and Git sync
+refuses their still-tracked memory. The marker contains no credentials and should be synced
+with configuration. A new laptop must bind the project before reading it; it cannot fall
+back to its old files. Do not run dual writers or an automatic Git bridge.
+
+The AgTrace implementation and protocol are in trace-agent's
+`backend/app/api/routes/memory_clients.py`; its `docs/local-memory-client.md` explains authority,
+recovery and cutover. The independent library, skill and instruction publication flows are
+unchanged by memory binding.
+
 ```text
 agent-sync init [dir]    initialize a data directory
 agent-sync               sync through the configured backend + link

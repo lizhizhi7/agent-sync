@@ -151,7 +151,10 @@ while [[ $# -gt 0 ]]; do
             AGENTS_ENABLED="$2"
             shift 2
             ;;
-        -h|--help)    ARGS+=("help"); shift ;;
+        -h|--help)
+            if [ "${ARGS[0]:-}" = memory ]; then ARGS+=("--help"); else ARGS+=("help"); fi
+            shift
+            ;;
         --env)        UNLINK_ENV=true; shift ;;
         *)            ARGS+=("$1"); shift ;;
     esac
@@ -163,7 +166,7 @@ ARG1="${ARGS[1]:-}"
 [ -z "$AGENTS_ENABLED" ] && AGENTS_ENABLED="${AGENT_SYNC_AGENTS:-$DEFAULT_AGENTS}"
 [ -z "$PREFIX" ] && PREFIX="$(echo "$HOME" | tr '/' '-')"
 [ -n "$WORKDIR" ] && PREFIX="${PREFIX}-$(echo "$WORKDIR" | tr '/' '-')"
-[ "$ACTION" = "help" ] || validate_agents
+[ "$ACTION" = "help" ] || [ "$ACTION" = memory ] || validate_agents
 
 # ---------- data directory resolution ----------
 
@@ -335,6 +338,7 @@ synced_data_paths() {
         .agent-sync-data \
         .agent-sync-projects \
         .agent-sync-skills \
+        .agent-sync-memory-owned \
         README.md \
         settings.json \
         instructions.md \
@@ -344,6 +348,54 @@ synced_data_paths() {
         projects
 }
 
+# A shared ownership marker prevents another device from reviving retired Git memory.
+project_is_external() {
+    local name="$1"
+    [ -f "$REPO_DIR/.agent-sync-memory-owned" ] || return 1
+    grep -Fqx -- "$name" "$REPO_DIR/.agent-sync-memory-owned"
+}
+
+prune_external_projects() {
+    local base="$1" name marker="$REPO_DIR/.agent-sync-memory-owned"
+    [ ! -f "$base/.agent-sync-memory-owned" ] || marker="$base/.agent-sync-memory-owned"
+    [ -f "$marker" ] || return 0
+    while IFS= read -r name || [ -n "$name" ]; do
+        [ -n "$name" ] || continue
+        validate_project_name "$name"
+        rm -rf "$base/projects/$name"
+    done < "$marker"
+}
+
+merge_memory_ownership() {
+    local candidate="$1" file name
+    local merged="$candidate/.agent-sync-memory-owned"
+    [ -f "$REPO_DIR/.agent-sync-memory-owned" ] || return 0
+    touch "$merged"
+    file="$(mktemp)"
+    cat "$REPO_DIR/.agent-sync-memory-owned" "$merged" | sort -u > "$file"
+    while IFS= read -r name || [ -n "$name" ]; do
+        [ -n "$name" ] || continue
+        validate_project_name "$name"
+    done < "$file"
+    mv "$file" "$merged"
+}
+
+preserve_external_projects() {
+    local candidate="$1" name source recovery destination
+    [ -f "$candidate/.agent-sync-memory-owned" ] || return 0
+    recovery="${AGENT_SYNC_MEMORY_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-sync/memory}/retired"
+    while IFS= read -r name || [ -n "$name" ]; do
+        [ -n "$name" ] || continue
+        validate_project_name "$name"
+        source="$REPO_DIR/projects/$name"
+        [ -e "$source" ] || [ -L "$source" ] || continue
+        (umask 077; mkdir -p "$recovery")
+        destination="$(mktemp -d "$recovery/$name.XXXXXX")"
+        cp -pR "$source" "$destination/project"
+        echo "Preserved retired project '$name' privately at $destination; reconcile it before disposal."
+    done < "$candidate/.agent-sync-memory-owned"
+}
+
 create_storage_archive() {
     local archive="$1" stage path
     stage="$(mktemp -d)"
@@ -351,6 +403,7 @@ create_storage_archive() {
         [ -e "$REPO_DIR/$path" ] || continue
         cp -pR "$REPO_DIR/$path" "$stage/$path"
     done < <(synced_data_paths)
+    prune_external_projects "$stage"
     if [ -d "$stage/mcp-servers" ]; then
         find "$stage/mcp-servers" -path '*/.venv' -type d -prune -exec rm -rf {} +
     fi
@@ -449,6 +502,9 @@ backend_pull() {
             if aws s3 ls "$uri" >/dev/null 2>&1; then
                 aws s3 cp "$uri" "$tmp/data.tar.gz"
                 extract_storage_archive "$tmp/data.tar.gz" "$tmp/extract"
+                merge_memory_ownership "$tmp/extract"
+                prune_external_projects "$tmp/extract"
+                preserve_external_projects "$tmp/extract"
                 clear_synced_data_paths
                 cp -pR "$tmp/extract/." "$REPO_DIR/"
                 echo "Pulled archive from $uri."
@@ -463,6 +519,9 @@ backend_pull() {
             if gcloud storage ls "$uri" >/dev/null 2>&1; then
                 gcloud storage cp "$uri" "$tmp/data.tar.gz"
                 extract_storage_archive "$tmp/data.tar.gz" "$tmp/extract"
+                merge_memory_ownership "$tmp/extract"
+                prune_external_projects "$tmp/extract"
+                preserve_external_projects "$tmp/extract"
                 clear_synced_data_paths
                 cp -pR "$tmp/extract/." "$REPO_DIR/"
                 echo "Pulled archive from $uri."
@@ -506,6 +565,16 @@ backend_push() {
 }
 
 git_commit_if_needed() {
+    local name
+    if [ -f "$REPO_DIR/.agent-sync-memory-owned" ]; then
+        while IFS= read -r name || [ -n "$name" ]; do
+            [ -n "$name" ] || continue
+            validate_project_name "$name"
+            if [ -n "$(git ls-files -- "projects/$name/memory")" ]; then
+                die "projects/$name/memory is owned by AgTrace but still tracked; settle and retire that path before config sync."
+            fi
+        done < "$REPO_DIR/.agent-sync-memory-owned"
+    fi
     git add -A
     if git diff --cached --quiet; then
         return 1
@@ -620,6 +689,9 @@ apply_project_mapping() {
     local local_name="$1" canonical="$2" agent local_mem canonical_mem
     validate_project_name "$local_name"
     validate_project_name "$canonical"
+    if project_is_external "$canonical"; then
+        die "project '$canonical' uses AgTrace memory; use memory bind, not project matching."
+    fi
     canonical_mem="$REPO_DIR/projects/$canonical/memory"
     mkdir -p "$canonical_mem"
     while IFS= read -r agent; do
@@ -772,6 +844,7 @@ link_agent_projects() {
             [ -n "$mapped" ] || continue
             validate_project_name "$local_name"
             validate_project_name "$mapped"
+            project_is_external "$mapped" && continue
             mkdir -p "$REPO_DIR/projects/$mapped/memory" "$AGENT_HOME/$rel/$local_name"
             make_link "$REPO_DIR/projects/$mapped/memory" "$AGENT_HOME/$rel/$local_name/memory"
             count=$((count + 1))
@@ -780,6 +853,7 @@ link_agent_projects() {
     for canonical_mem in "$REPO_DIR"/projects/*/memory; do
         [ ! -d "$canonical_mem" ] && continue
         canonical="$(basename "$(dirname "$canonical_mem")")"
+        project_is_external "$canonical" && continue
 
         mkdir -p "$AGENT_HOME/$rel/$canonical"
         make_link "$canonical_mem" "$AGENT_HOME/$rel/$canonical/memory"
@@ -808,6 +882,7 @@ migrate_agent_memory() {
         [ -L "$device_mem" ] && continue
         device_dir="$(basename "$(dirname "$device_mem")")"
         canonical="$(canonical_for_device_project "$device_dir")"
+        project_is_external "$canonical" && continue
         mkdir -p "$REPO_DIR/projects/$canonical/memory"
         copy_tree_no_clobber "$device_mem" "$REPO_DIR/projects/$canonical/memory"
         count=$((count + 1))
@@ -1012,6 +1087,8 @@ Use agent-sync for durable agent configuration and memory changes on this machin
 - Agents without native access to synced project memory (including Codex) must run `agent-sync memory` at the start of repository work, use its `MEMORY.md` output as the index, and read relevant detail files before acting.
 - Run `agent-sync match` if a project appears under a new local project name.
 - Run `agent-sync sync` after changes that should be shared across devices.
+- Bound AgTrace project memory replaces the old projects/<name>/memory store. Use the index and isolated session returned by `agent-sync memory`. Publish its optional Markdown corrections with the printed `agent-sync memory push --session <id>` command. Workspace links may coexist over one admitted shared repository root. The selected target workspace supplies its overlay; existing sessions retain that destination. Keep only name, description, type and audience in frontmatter; repository audience promotes shareable edits, workspace audience stays local. Load missing bodies with memory load and trusted metadata with memory inspect.
+- Project matching and Git/config sync never replace an AgTrace memory binding or publish skills to the platform.
 - Do not edit shell profiles, unlink synced files, or delete local agent data unless the user asks.
 EOF
 }
@@ -1198,6 +1275,9 @@ do_match() {
 do_memory() {
     local project_path="${1:-$PWD}" canonical memory_dir index file found=false
     canonical="$(canonical_for_project_path "$project_path")"
+    if project_is_external "$canonical"; then
+        die "project '$canonical' uses AgTrace memory; link its workspace and bind this checkout first."
+    fi
     memory_dir="$REPO_DIR/projects/$canonical/memory"
     index="$memory_dir/MEMORY.md"
 
@@ -1380,6 +1460,7 @@ write_data_repo_scaffold() {
 !.agent-sync-data
 !.agent-sync-projects
 !.agent-sync-skills
+!.agent-sync-memory-owned
 !README.md
 
 # Top-level config
@@ -1918,8 +1999,31 @@ case "$ACTION" in
         ;;
 esac
 
+if [ "$ACTION" = memory ] && command_exists python3; then
+    memory_helper="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().parent.parent / "libexec/memory.py")' "${BASH_SOURCE[0]}")"
+    if python3 "$memory_helper" "${ARGS[@]:1}"; then
+        exit 0
+    else
+        memory_status=$?
+        # Only an unbound repository falls through to the legacy project-file reader.
+        [ "$memory_status" -eq 3 ] || exit "$memory_status"
+    fi
+fi
+
 REPO_DIR="$(resolve_repo_dir)"
+[ "$ACTION" != memory ] || validate_agents
 validate_skill_rules
+
+case "$ACTION" in
+    push|pull|sync)
+        if command_exists python3 && [ -f "${AGENT_SYNC_MEMORY_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-sync/memory}/profile.json" ]; then
+            memory_helper="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().parent.parent / "libexec/memory.py")' "${BASH_SOURCE[0]}")"
+            if git rev-parse --git-dir >/dev/null 2>&1; then
+                python3 "$memory_helper" transport "$ACTION" --project "$PWD"
+            fi
+        fi
+        ;;
+esac
 
 case "$ACTION" in
     link)

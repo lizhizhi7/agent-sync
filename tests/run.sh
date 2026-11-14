@@ -9,6 +9,7 @@ BIN="$ROOT/bin/agent-sync"
 # assertion. Tests that need a variable set it themselves, per invocation.
 unset AGENT_SYNC_AGENTS AGENT_SYNC_DIR AGENT_SYNC_BACKEND AGENT_SYNC_REMOTE
 unset AGENT_SYNC_STORAGE_OBJECT AGENT_SYNC_STORAGE_URI AGENT_SYNC_WORKDIR
+unset AGENT_SYNC_MEMORY_HOME AGENT_SYNC_MEMORY_CREDENTIAL_HELPER AGENT_SYNC_MEMORY_NO_BROWSER
 
 pass_count=0
 tmp_dirs=()
@@ -160,6 +161,9 @@ test_s3_push_uses_allowlisted_archive() {
     printf 'venv secret\n' > "$data/mcp-servers/server/.venv/secret.txt"
     printf 'conversation\n' > "$data/projects/-app/session.jsonl"
     printf 'memory\n' > "$data/projects/-app/memory/note.md"
+    mkdir -p "$data/projects/-retired/memory"
+    printf 'retained legacy source\n' > "$data/projects/-retired/memory/old.md"
+    printf -- '-retired\n' > "$data/.agent-sync-memory-owned"
     cat > "$fake_bin/aws" <<'AWS'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -185,6 +189,9 @@ AWS
     [[ "$listing" == *"./settings.json"* ]] || { echo "settings.json missing from archive" >&2; exit 1; }
     [[ "$listing" == *"./.agent-sync-projects"* ]] || { echo "mapping file missing from archive" >&2; exit 1; }
     [[ "$listing" == *"./projects/-app/memory/note.md"* ]] || { echo "memory note missing from archive" >&2; exit 1; }
+    [[ "$listing" == *"./.agent-sync-memory-owned"* ]] || { echo "memory ownership missing from archive" >&2; exit 1; }
+    [[ "$listing" != *"projects/-retired"* ]] || { echo "retired memory leaked into archive" >&2; exit 1; }
+    assert_file "$data/projects/-retired/memory/old.md"
     [[ "$listing" != *"extra-secret.txt"* ]] || { echo "extra file leaked into archive" >&2; exit 1; }
     [[ "$listing" != *".venv"* ]] || { echo ".venv leaked into archive" >&2; exit 1; }
     [[ "$listing" != *".jsonl"* ]] || { echo "jsonl leaked into archive" >&2; exit 1; }
@@ -791,5 +798,6 @@ run_test "derived skill updates require candidate validation" test_derived_skill
 run_test "harness skill rules preserve native skills and reject removed harnesses" test_harness_skill_rules
 
 python3 "$ROOT/tests/test_resources.py"
+python3 "$ROOT/tests/test_memory.py"
 
 printf 'ok: %s tests passed\n' "$pass_count"
