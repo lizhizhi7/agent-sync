@@ -42,12 +42,12 @@ class Memory(unittest.TestCase):
         self.addCleanup(self.patcher.stop)
         self.item = {'name': 'repo', 'server': 'https://memory.example', 'workspace': 'one',
                      'registry_id': 'a' * 32, 'credential_key': 'test', 'mode': 'write'}
-        self.snapshot = {'id': 'a' * 32, 'scope': 'one', 'protocol': 1, 'generation': 1, 'writable': True,
+        self.snapshot = {'id': 'a' * 32, 'scope': 'one', 'protocol': 2, 'view':'1:1', 'generation': 1, 'writable': True,
             'files': {'fact.md': {'revision': 'b' * 32, 'content': encoded('base'),
                                   'sha256': client.digest(b'base')}}}
 
     def open(self, writable=True):
-        with patch.object(client, 'request', return_value=self.snapshot):
+        with patch.object(client, 'request', return_value=self.snapshot), patch.object(client,'load_bodies'):
             return client.open_session(self.repo, self.item, writable=writable, credentials=Credentials())
 
     def test_unbound_backend_does_not_require_git_or_data_directory(self):
@@ -65,16 +65,16 @@ class Memory(unittest.TestCase):
         first = client.connection_key(self.item['server'], self.item['workspace']) + ':' + self.item['registry_id']
         second = client.connection_key(secondary['server'], secondary['workspace']) + ':' + secondary['registry_id']
         client.save_profile({'version': 1, 'workspaces': {}, 'repositories': {self.repo['key']: {
-            'active': True, 'primary': first, 'bindings': {first: self.item, second: secondary}}}})
-        client.main(['primary', '--workspace', 'two', '--project', str(self.repo_path)])
+            'active': True, 'target': first, 'bindings': {first: self.item, second: secondary}}}})
+        client.main(['target', '--workspace', 'two', '--project', str(self.repo_path)])
         config = client.profile()['repositories'][self.repo['key']]
         self.assertEqual(len(config['bindings']), 2)
-        self.assertEqual(config['bindings'][config['primary']]['workspace'], 'two')
+        self.assertEqual(config['bindings'][config['target']]['workspace'], 'two')
         self.assertEqual(client.load_session(state['id'])[1]['binding']['workspace'], 'one')
 
     def test_missing_primary_requires_selection_instead_of_first_match(self):
-        config = {'repositories': {self.repo['key']: {'primary': '', 'bindings': {'first': self.item}}}}
-        with self.assertRaisesRegex(client.Failure, 'Choose a primary'):
+        config = {'repositories': {self.repo['key']: {'target': '', 'bindings': {'first': self.item}}}}
+        with self.assertRaisesRegex(client.Failure, 'Choose a target'):
             client.binding(config, self.repo)
 
     def test_secondary_reference_cannot_publish_even_when_grant_can_write(self):

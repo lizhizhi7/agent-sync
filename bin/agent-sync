@@ -1087,7 +1087,7 @@ Use agent-sync for durable agent configuration and memory changes on this machin
 - Agents without native access to synced project memory (including Codex) must run `agent-sync memory` at the start of repository work, use its `MEMORY.md` output as the index, and read relevant detail files before acting.
 - Run `agent-sync match` if a project appears under a new local project name.
 - Run `agent-sync sync` after changes that should be shared across devices.
-- Bound AgTrace project memory uses the index and isolated session returned by `agent-sync memory`. Publish its optional Markdown corrections with the printed `agent-sync memory push --session <id>` command. Workspace links may coexist; the selected primary is the default, and existing sessions retain their original registry when it changes.
+- Bound AgTrace project memory replaces the old projects/<name>/memory store. Use the index and isolated session returned by `agent-sync memory`. Publish its optional Markdown corrections with the printed `agent-sync memory push --session <id>` command. Workspace links may coexist over one admitted shared repository root. The selected target workspace supplies its overlay; existing sessions retain that destination. Keep only name, description, type and audience in frontmatter; repository audience promotes shareable edits, workspace audience stays local. Load missing bodies with memory load and trusted metadata with memory inspect.
 - Project matching and Git/config sync never replace an AgTrace memory binding or publish skills to the platform.
 - Do not edit shell profiles, unlink synced files, or delete local agent data unless the user asks.
 EOF

@@ -191,7 +191,7 @@ def request(server, path, *, token='', body=None):
     if data is not None:
         headers['Content-Type'] = 'application/json'
     try:
-        with build_opener(NoRedirect()).open(Request(server + '/api/memory-sync/v1' + path,
+        with build_opener(NoRedirect()).open(Request(server + '/api/memory-sync/v2' + path,
                 data=data, headers=headers), timeout=30) as response:
             raw = response.read(MAX_BYTES * 3 + 1)
             if len(raw) > MAX_BYTES * 3:
@@ -350,9 +350,33 @@ def collect(directory):
     return files
 
 
+def write_leaf(directory,name,raw,*,expected=None):
+    """Never follow a task-edited ancestor or overwrite bytes newer than a receipt."""
+    fd=os.open(directory,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    try:
+        for part in checked_path(name).split('/')[:-1]:
+            try:os.mkdir(part,mode=0o700,dir_fd=fd)
+            except FileExistsError:pass
+            child=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd);os.close(fd);fd=child
+        flags=os.O_RDWR|os.O_NOFOLLOW|os.O_NONBLOCK
+        if expected is None:flags|=os.O_CREAT|os.O_EXCL
+        try:leaf=os.open(name.split('/')[-1],flags,0o600,dir_fd=fd)
+        except FileNotFoundError:return False
+        try:
+            if not stat.S_ISREG(os.fstat(leaf).st_mode):raise Failure('Memory leaf must be a regular file')
+            if expected is not None and os.read(leaf,MAX_FILE+1)!=expected:return False
+            os.lseek(leaf,0,os.SEEK_SET);os.ftruncate(leaf,0)
+            with os.fdopen(os.dup(leaf),'wb') as stream:stream.write(raw);stream.flush();os.fsync(stream.fileno())
+            return True
+        finally:os.close(leaf)
+    finally:os.close(fd)
+
+
 def delta(base, files):
     return [{'path': name, 'expected': base.get(name, {}).get('revision', ''), 'content': files.get(name)}
-            for name in sorted(base.keys() | files.keys()) if base.get(name, {}).get('content') != files.get(name)]
+            for name in sorted(base.keys() | files.keys()) if not (name not in files and 'content' not in base.get(name, {}))
+            and not (name in files and 'content' not in base.get(name,{}) and digest(base64.b64decode(files[name]))==base.get(name,{}).get('sha256'))
+            and base.get(name, {}).get('content') != files.get(name)]
 
 
 def binding(value, repo, workspace='', server=''):
@@ -365,53 +389,79 @@ def binding(value, repo, workspace='', server=''):
         if len(matches) != 1:
             raise Failure('Select one registry with --workspace and --server')
         return config, matches[0]
-    if not config.get('primary') or config['primary'] not in config['bindings']:
+    if not config.get('target') or config['target'] not in config['bindings']:
         choices = ', '.join(item['workspace'] for item in config['bindings'].values())
-        raise Failure('Choose a primary registry with memory primary --workspace <workspace>; linked: ' + choices)
-    return config, config['bindings'][config['primary']]
+        raise Failure('Choose a target workspace with memory target --workspace <workspace>; linked: ' + choices)
+    return config, config['bindings'][config['target']]
+
+
+def load_bodies(item, entries, credentials):
+    wanted=[];size=0
+    for name,entry in sorted(entries.items(),key=lambda p:(p[0]!='MEMORY.md',p[0])):
+        if entry.get('deleted'):entry['content']=None;continue
+        if len(wanted)>=32 or size+entry.get('size',0)>256*1024:continue
+        wanted.append(entry['revision']);size+=entry.get('size',0)
+    missing=[]
+    for name,entry in entries.items():
+        if entry['revision'] not in wanted:entry.pop('content',None);continue
+        blob=root()/'blobs'/entry['sha256']
+        if blob.exists():
+            raw=blob.read_bytes()
+            if digest(raw)==entry['sha256']:
+                entry['content']=base64.b64encode(raw).decode();continue
+        missing.append(entry['revision'])
+    if missing:
+        bodies=request(item['server'],'/registries/'+item['registry_id']+'/bodies',
+            token=credentials.get(item['credential_key']),body={'revisions':missing})['bodies']
+        for entry in entries.values():
+            if entry['revision'] not in missing:continue
+            body=bodies[entry['revision']];raw=base64.b64decode(body['content'],validate=True)
+            if len(raw)>MAX_FILE or digest(raw)!=entry['sha256']:raise Failure('Memory body failed its digest or byte budget')
+            raw.decode('utf-8');entry['content']=body['content']
+            folder=safe_directory(root()/'blobs');target=folder/entry['sha256']
+            if not target.exists():target.write_bytes(raw)
 
 
 def snapshot(item, credentials=None, *, offline=False):
-    credentials = credentials or Credentials()
-    namespace = connection_key(item['server'], item['workspace']) + '-' + item['registry_id']
-    cache_path = root() / 'cache' / namespace / 'snapshot.json'
-    cache = read(cache_path) if cache_path.exists() else None
+    credentials=credentials or Credentials()
+    namespace=connection_key(item['server'],item['workspace'])+'-'+item['registry_id']
+    cache_path=root()/'cache'/namespace/'snapshot.json'
+    cache=read(cache_path) if cache_path.exists() else None
     if offline:
-        if not cache:
-            raise Failure('No complete cached memory snapshot; reconnect before opening this registry')
-        return cache, True
+        if not cache:raise Failure('No cached memory view; reconnect before opening this workspace')
+        return cache,True
+    base='/registries/'+item['registry_id']+'/snapshot'
+    files=dict(cache['files']) if cache else {}
+    after='';view='';since=cache.get('view','') if cache else ''
     try:
-        value = request(item['server'], '/registries/' + item['registry_id'] + '/snapshot' +
-            ('?' + urlencode({'generation': cache['generation']}) if cache else ''), token=credentials.get(item['credential_key']))
+        for page_n in range(202):
+            query={k:v for k,v in {'since':since,'after':after,'view':view}.items() if v}
+            value=request(item['server'],base+('?' + urlencode(query) if query else ''),token=credentials.get(item['credential_key']))
+            if value.get('protocol')!=2 or value.get('id')!=item['registry_id'] or value.get('scope')!=item['workspace']:
+                raise Failure('Memory view identity or protocol differs from the bound workspace')
+            if value.get('unchanged'):
+                if not cache or value.get('view')!=cache.get('view'):raise Failure('Memory view acknowledgement differs from cache')
+                return {**cache,'fetched_at':datetime.now(timezone.utc).isoformat()},False
+            if not view:
+                view=value['view']
+                if not value.get('delta'):files={}
+            if value['view']!=view:raise Failure('Memory changed while paging; reopen to retry with a consistent view')
+            for name,entry in value['files'].items():
+                checked_path(name)
+                if not re.fullmatch('[0-9a-f]{64}',entry.get('sha256','')):raise Failure('Memory view has an invalid body digest')
+                if not IDENTITY.fullmatch(entry.get('revision','')):raise Failure('Memory view has an invalid revision')
+                files[name]=entry
+            if len(files)>10000:raise Failure('Memory catalogue exceeds 10000 paths')
+            after=value.get('next','')
+            if not after:break
+        else:raise Failure('Memory catalogue exceeded 202 pages; reopen from a fresh view')
+        value={**value,'files':files,'fetched_at':datetime.now(timezone.utc).isoformat()}
+        load_bodies(item,files,credentials)
+        atomic(cache_path,value)
+        return value,False
     except Unavailable:
-        if cache:
-            return cache, True
+        if cache:return cache,True
         raise
-    if value.get('unchanged'):
-        if not cache or value['id'] != item['registry_id'] or value['generation'] != cache['generation']:
-            raise Failure('Server snapshot acknowledgment does not match this cache')
-        value = {**cache, 'fetched_at': datetime.now(timezone.utc).isoformat()}
-    else:
-        if value.get('protocol') != 1 or value.get('id') != item['registry_id'] or value.get('scope') != item['workspace']:
-            raise Failure('Snapshot identity or protocol differs from the bound registration')
-        if len(value.get('files', {})) > 8192:
-            raise Failure('Snapshot exceeds 8192 document heads, including tombstones')
-        total = 0
-        for name, entry in value['files'].items():
-            checked_path(name)
-            if not IDENTITY.fullmatch(entry.get('revision', '')):
-                raise Failure('Snapshot has an invalid document revision')
-            if entry['content'] is not None:
-                raw = base64.b64decode(entry['content'], validate=True)
-                raw.decode('utf-8')
-                total += len(raw)
-                if len(raw) > MAX_FILE or digest(raw) != entry['sha256']:
-                    raise Failure(f'{name}: snapshot content failed its digest or byte budget')
-        if total > MAX_BYTES:
-            raise Failure('Snapshot exceeds its byte budget')
-        value['fetched_at'] = datetime.now(timezone.utc).isoformat()
-    atomic(cache_path, value)
-    return value, False
 
 
 def session_path(identity):
@@ -428,12 +478,12 @@ def open_session(repo, item, *, writable, offline=False, credentials=None):
     directory = session_path(identity)
     content = safe_directory(directory / 'content')
     for name, entry in value['files'].items():
-        if entry['content'] is not None:
+        if entry.get('content') is not None:
             target = content / checked_path(name)
             target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             target.write_bytes(base64.b64decode(entry['content']))
     state = {'version': 1, 'id': identity, 'repository': repo, 'binding': item,
-        'files': value['files'], 'generation': value['generation'], 'fetched_at': value['fetched_at'],
+        'files': value['files'], 'view':value['view'], 'generation': value['generation'], 'fetched_at': value['fetched_at'],
         'writable': writable, 'status': 'saved', 'stale': stale}
     atomic(directory / 'state.json', state)
     label = 'STALE cached snapshot' if stale else 'Current snapshot'
@@ -444,10 +494,17 @@ def open_session(repo, item, *, writable, offline=False, credentials=None):
         + ('Edit Markdown only under content/. Publish optional corrections with:\n\n'
            f'    agent-sync memory push --session {identity}\n\n' if writable else
            'This is a read-only reference. Its edits cannot be published.\n\n'))
-    for name, entry in sorted(value['files'].items()):
-        if entry['content'] is not None and 'archive' not in [p.lower() for p in name.split('/')]:
+    for name,entry in sorted(value['files'].items()):
+        if entry.get('deleted'):continue
+        description=entry.get('frontmatter',{}).get('description','')
+        if entry.get('content') is not None:
             from urllib.parse import quote
-            index += f'- [{name}](content/{quote(name, safe="/")})\n'
+            index+=f'- [{name}](content/{quote(name,safe="/")}) — {description}\n'
+        else:index+=f'- `{name}` (not loaded) — {description}\n'
+    index += ('\nOnly linked documents are on disk. Load another with:\n\n'
+        f'    agent-sync memory load --session {identity} --path <path>\n\n'
+        'Keep only name, description, type and audience in frontmatter. audience: repository promotes '
+        'shareable edits; audience: workspace keeps the entry in this workspace. Inspect provenance and history with memory inspect.\n')
     (directory / 'MEMORY.md').write_text(index)
     print(index, end='')
     print('\nProject memory:', directory / 'MEMORY.md')
@@ -511,12 +568,22 @@ def push(identity, credentials=None):
                 raise Failure('Saved receipt omits submitted document revisions; retry the exact pending request')
             for change in pending['changes']:
                 state['files'][change['path']] = {'revision': result['revisions'][change['path']],
-                    'content': change['content']}
+                    'content':result.get('files',{}).get(change['path'],{}).get('content',change['content'])}
+                accepted=state['files'][change['path']]['content']
+                captured=base64.b64decode(change['content']) if change['content'] is not None else None
+                if accepted is not None and captured is not None:
+                    write_leaf(directory/'content',change['path'],base64.b64decode(accepted),expected=captured)
+            state['view']=result.get('view',state.get('view',''))
             state['generation'] = result['generation']
             state['last_receipt'] = result
             state['pending'] = None
         atomic(directory / 'state.json', state)
         print('Memory', result['state'] + ':', result['id'])
+        promotion=result.get('promotion',{}).get('state','')
+        if promotion=='saved':print('Shared repository memory promoted.')
+        elif promotion in ('pending','conflict','blocked'):
+            print('Workspace source saved; shared promotion is '+promotion+'. Inspect the receipt or review it in AgTrace memory management.')
+        elif promotion=='not_requested':print('Saved in the workspace overlay.')
         if result['state'] == 'conflict':
             raise Failure('No document heads changed. Retained conflict: ' + result['id'] +
                           '; run memory resolve --session ' + identity)
@@ -574,7 +641,7 @@ def resolve(identity, *, apply=False, credentials=None):
             destination = session_path(resolution_id)
             safe_directory(destination / 'content')
             complete = {name: entry['content'] for name, entry in draft['base'].items()
-                        if entry['content'] is not None and name not in draft['paths']}
+                        if entry.get('content') is not None and name not in draft['paths']}
             complete.update(files)
             for name, raw in complete.items():
                 target = destination / 'content' / name
@@ -612,6 +679,10 @@ def parser():
     p.add_argument('--apply', action='store_true')
     p.add_argument('--legacy-canonical', default='')
     p.add_argument('--source-sha256', default='')
+    p.add_argument('--path', default='')
+    p.add_argument('--section', default='summary', choices=['summary','body','provenance','evidence','history','diff','blame'])
+    p.add_argument('--revision', default='')
+    p.add_argument('--before', type=int, default=0)
     return p
 
 
@@ -619,7 +690,7 @@ def main(argv=None):
     args = parser().parse_args(argv)
     value = profile()
     op = args.operation
-    known = {'workspace', 'bind', 'primary', 'status', 'diff', 'push', 'resolve', 'activate', 'open', 'transport'}
+    known = {'workspace', 'bind', 'target', 'status', 'diff', 'push', 'resolve', 'activate', 'open', 'transport','load','inspect'}
     if op not in known:
         args.project, op = op, 'open'
     if op == 'workspace':
@@ -633,6 +704,26 @@ def main(argv=None):
             save_profile(value)
         print('Workspace linked:', args.workspace_name)
         return 0
+    if op in ('load','inspect'):
+        directory,state=load_session(args.session)
+        name=checked_path(args.path);item=state['binding'];credentials=Credentials()
+        if op=='inspect':
+            query=urlencode({'path':name,'revision':args.revision,'section':args.section,'before':args.before})
+            print(json.dumps(request(item['server'],'/registries/'+item['registry_id']+'/inspect?'+query,
+                token=credentials.get(item['credential_key'])),indent=2,ensure_ascii=False));return 0
+        entry=state['files'].get(name)
+        if not entry or entry.get('deleted'):raise Failure('Select an active document in this session’s pinned catalogue')
+        body=request(item['server'],'/registries/'+item['registry_id']+'/bodies',
+            token=credentials.get(item['credential_key']),body={'revisions':[entry['revision']]})['bodies'][entry['revision']]
+        raw=base64.b64decode(body['content'],validate=True)
+        if digest(raw)!=entry['sha256']:raise Failure('Pinned memory body failed its digest')
+        target=directory/'content'/name
+        with lock(directory/'coordinator.lock'):
+            _,state=load_session(args.session)
+            try:write_leaf(directory/'content',name,raw)
+            except FileExistsError:raise Failure('Document already exists locally; its edits are preserved') from None
+            state['files'][name]={**entry,'content':body['content']};atomic(directory/'state.json',state)
+        print('Loaded pinned memory:',target);return 0
     if op in ('push', 'resolve', 'diff'):
         if not args.session:
             raise Failure('Select the exact session with --session <id>; no session is selected implicitly')
@@ -694,7 +785,7 @@ def main(argv=None):
         key = connection_key(item['server'], item['workspace']) + ':' + item['registry_id']
         with lock(root() / 'profile.lock'):
             value = profile()
-            config = value['repositories'].setdefault(repo['key'], {'bindings': {}, 'primary': '', 'active': False})
+            config = value['repositories'].setdefault(repo['key'], {'bindings': {}, 'target': '', 'active': False})
             config['bindings'][key] = item
             save_profile(value)
         print('Bound', repo['key'], 'to', item['workspace'], item['registry_id'], '(' + args.access + ')')
@@ -717,18 +808,18 @@ def main(argv=None):
     key = connection_key(item['server'], item['workspace']) + ':' + item['registry_id']
     if args.repo and args.repo != item['name']:
         raise Failure('--repo differs from the selected registration; choose the matching workspace and name')
-    if op == 'primary':
+    if op == 'target':
         if not args.workspace:
-            raise Failure('Select the primary with --workspace <linked-workspace>')
+            raise Failure('Select the target with --workspace <linked-workspace>')
         with lock(root() / 'profile.lock'):
             value = profile()
-            value['repositories'][repo['key']]['primary'] = key
+            value['repositories'][repo['key']]['target'] = key
             save_profile(value)
-        print('Primary registry selected:', item['workspace'], item['registry_id'], '; existing sessions retain their original destinations')
+        print('Default target workspace selected:', item['workspace'], item['registry_id'], '; existing sessions retain their original destinations')
         return 0
     if op == 'activate':
-        if config.get('primary') != key:
-            raise Failure('Activate the selected primary registry, not a secondary workspace reference')
+        if config.get('target') != key:
+            raise Failure('Activate the selected target workspace, not a secondary workspace reference')
         name = args.legacy_canonical or canonical(args.project)
         if not re.fullmatch(r'[-_A-Za-z0-9.]+', name) or name in ('.', '..'):
             raise Failure('--legacy-canonical must be one canonical project name')
@@ -742,7 +833,7 @@ def main(argv=None):
             if (settled['binding']['registry_id'] != item['registry_id'] or settled['binding']['workspace'] != item['workspace'] or
                     settled['binding']['server'] != item['server'] or settled.get('pending') or
                     delta(settled['files'], collect(directory / 'content'))):
-                raise Failure('The reconciliation session must be saved and clean in the selected primary registry')
+                raise Failure('The reconciliation session must be saved and clean in the selected target workspace')
         if data:
             marker = Path(data) / '.agent-sync-memory-owned'
             ignore = Path(data) / '.gitignore'

@@ -206,16 +206,16 @@ Object storage has no merge/conflict resolution. Treat one device as the active 
 ### AgTrace repository memory
 
 Memory can use AgTrace independently of the configuration backend. Link several workspaces,
-bind their exact repository registrations, and select one primary for the current Git
-repository. Duplicate repository names in different workspaces remain separate. The primary
-is a local default; changing it copies no content and never retargets an existing session.
+bind their exact repository registrations, and select a default target workspace for the current Git
+repository. Admitted bindings for the same provider identity share one repository memory root.
+Each workspace adds its own overlay. The target is a local default; changing it copies no content and never retargets an existing session.
 
 ```bash
 agent-sync memory workspace link agtrace --server https://agtrace.example.com
 agent-sync memory workspace link other-team --server https://agtrace.example.com
 agent-sync memory bind --workspace agtrace --repo myapp --access write
 agent-sync memory bind --workspace other-team --repo myapp --access read
-agent-sync memory primary --workspace agtrace
+agent-sync memory target --workspace agtrace
 ```
 
 Linking and binding open a personal sign-in/consent page. Verify the code shown by the CLI
@@ -231,7 +231,7 @@ stdout. Its diagnostics must not include credentials. Tokens never enter the syn
 directory. `AGENT_SYNC_MEMORY_HOME` optionally selects the device-local profile, cache and
 journal directory; otherwise it uses the XDG state directory under `agent-sync/memory`.
 
-For a new project without legacy memory, explicitly activate after selecting the primary:
+For a new project without legacy memory, explicitly activate after selecting the target workspace:
 
 ```bash
 agent-sync memory activate
@@ -247,6 +247,16 @@ agent-sync memory push --session <id>
 agent-sync memory status
 ```
 
+The protocol fetches a paged current catalogue and only a bounded working set of bodies.
+Subsequent opens use a shared/workspace generation pair and changed heads; digest caches
+avoid refetching unchanged bodies. Unloaded files are labelled in the index. Use
+`memory load --session <id> --path <path>` to materialize a pinned document, and
+`memory inspect --session <id> --path <path> --section history` for trusted metadata.
+Markdown frontmatter has only `name`, `description`, `type` and `audience`. Set audience to
+`repository` for direct promotion of shareable edits, or `workspace` to retain private
+workspace knowledge. Unclassified edits default to workspace. Actor, workspace, task/session,
+time, evidence, versions, diffs and passage attribution belong in the service, not each header.
+
 The old `memory [directory]` form remains available. Subcommands use `--project <directory>`
 for another checkout. `memory --workspace other-team` opens a separately labelled read-only
 reference; `--write` additionally requires that registration's contribution grant. Resume
@@ -256,7 +266,8 @@ denials do not fall back to cache. `memory --offline` explicitly opens that cach
 
 Publication uses per-file expected revisions and an exact journaled request. If its response
 is lost, repeat the same push: acknowledged bytes advance while newer edits stay local. A
-conflict changes no heads. `memory resolve --session <id>` prepares `base/`, `current/` and
+workspace version conflict changes no heads. A shared promotion conflict retains the saved
+workspace proposal; review it in AgTrace and promote against the explicit current shared version. `memory resolve --session <id>` prepares `base/`, `current/` and
 editable proposed `content/`; after reviewing, use the same command with `--apply`. The
 resolution has its own journal. The original projection remains retained, including newer
 edits, and becomes read-only after a successful resolution. Reopen fresh memory and reconcile
@@ -271,7 +282,7 @@ transport. No memory command publishes skills or rewrites repository instruction
 retained import base, current local files and selected central registry. Use an explicitly
 writable initial projection (`memory open --write --session new`) and publish the reviewed
 delta. Activation over existing data requires its exact source digest and a saved, clean
-session in the primary registry; `memory --help` owns those arguments. Retire the audited
+session in the target workspace; `memory --help` owns those arguments. Retire the audited
 Git-tracked memory path and only its agent-sync-owned native links. Keep historical source
 and unsettled work. `.agent-sync-memory-owned` records which canonical projects have left
 the old transport: they are not remigrated, relinked or included in archives, and Git sync
