@@ -1085,6 +1085,7 @@ Use agent-sync for durable agent configuration and memory changes on this machin
 
 - Run `agent-sync status` before changing synced config or project memory when context is unclear.
 - Agents without native access to synced project memory (including Codex) must run `agent-sync memory` at the start of repository work, use its `MEMORY.md` output as the index, and read relevant detail files before acting.
+- On macOS, sandboxed Codex must run `agent-sync memory` commands with approved host execution (`require_escalated`) so the OS Keychain is reachable. A sandbox Keychain error does not mean a missing or revoked grant; retry the same command with host access before suggesting relinking or rebinding. Never export credentials or weaken the sandbox to work around it.
 - Run `agent-sync match` if a project appears under a new local project name.
 - Run `agent-sync sync` after changes that should be shared across devices.
 - Bound AgTrace project memory replaces the old projects/<name>/memory store. Use the index and isolated session returned by `agent-sync memory`. Publish its optional Markdown corrections with the printed `agent-sync memory push --session <id>` command. Workspace links may coexist over one admitted shared repository root. The selected target workspace supplies its overlay; existing sessions retain that destination. Keep only name, description, type and audience in frontmatter; repository audience promotes shareable edits, workspace audience stays local. Load missing bodies with memory load and trusted metadata with memory inspect.

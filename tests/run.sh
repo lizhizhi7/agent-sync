@@ -449,6 +449,7 @@ test_instructions_install_and_remove_managed_block() {
 
     grep -Fqx '<!-- >>> agent-sync:auto-sync >>> -->' "$data/instructions.md" || { echo "instruction block missing" >&2; exit 1; }
     grep -Fq "must run \`agent-sync memory\`" "$data/instructions.md" || { echo "project-memory instruction missing" >&2; exit 1; }
+    grep -Fq 'require_escalated' "$data/instructions.md" || { echo "sandbox Keychain instruction missing" >&2; exit 1; }
 
     # One shared file reaches every agent through its own linked name.
     HOME="$home" AGENT_SYNC_DIR="$data" AGENT_SYNC_BACKEND=local AGENT_SYNC_AGENTS=claude,codex agent_sync link >/dev/null

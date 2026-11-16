@@ -231,6 +231,12 @@ stdout. Its diagnostics must not include credentials. Tokens never enter the syn
 directory. `AGENT_SYNC_MEMORY_HOME` optionally selects the device-local profile, cache and
 journal directory; otherwise it uses the XDG state directory under `agent-sync/memory`.
 
+Sandboxed Codex on macOS must invoke memory commands through approved host execution
+(`require_escalated`) to reach Keychain. The sandbox can report an existing item as missing;
+retry the same command with host access before relinking a workspace or rebinding a repository.
+The managed instruction block installed by `agent-sync instructions install` includes this
+procedure. Do not copy grants to files or change Keychain permissions to bypass the sandbox.
+
 For a new project without legacy memory, explicitly activate after selecting the target workspace:
 
 ```bash
