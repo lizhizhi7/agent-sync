@@ -25,6 +25,33 @@ class Credentials:
         return 'synthetic credential'
 
 
+class KeychainAccess(unittest.TestCase):
+    def test_sandbox_failure_preserves_binding_and_requests_host_execution(self):
+        result = subprocess.CompletedProcess([], 44, stdout='never expose this',
+            stderr='The specified item could not be found in the keychain.')
+        with patch.dict(os.environ, {'CODEX_SANDBOX': 'seatbelt'}, clear=True), \
+                patch.object(client.sys, 'platform', 'darwin'), \
+                patch.object(client.subprocess, 'run', return_value=result) as run:
+            with self.assertRaises(client.Failure) as caught:
+                client.Credentials().get('synthetic-key')
+        message = str(caught.exception)
+        self.assertIn('require_escalated', message)
+        self.assertIn('Keep the existing workspace link', message)
+        self.assertNotIn('reconnect with', message)
+        self.assertNotIn('never expose this', message)
+        run.assert_called_once()
+
+    def test_success_and_custom_helper_keep_their_existing_contract(self):
+        with patch.dict(os.environ, {'CODEX_SANDBOX': 'seatbelt'}, clear=True), \
+                patch.object(client.sys, 'platform', 'darwin'), \
+                patch.object(client.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, 'synthetic grant\n', '')):
+            self.assertEqual(client.Credentials().get('synthetic-key'), 'synthetic grant')
+        with patch.dict(os.environ, {'CODEX_SANDBOX': 'seatbelt', 'AGENT_SYNC_MEMORY_CREDENTIAL_HELPER': '/synthetic/helper'}, clear=True), \
+                patch.object(client.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1, '', '')):
+            with self.assertRaisesRegex(client.Failure, 'OS credential store refused access'):
+                client.Credentials().get('synthetic-key')
+
+
 class Memory(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

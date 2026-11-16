@@ -237,6 +237,11 @@ class Credentials:
         else:
             raise Failure('Configure AGENT_SYNC_MEMORY_CREDENTIAL_HELPER for your OS credential store')
         if result.returncode:
+            if not helper and sys.platform == 'darwin' and os.environ.get('CODEX_SANDBOX'):
+                raise Failure('macOS Keychain is unavailable inside the Codex sandbox; retry the same '
+                              'agent-sync memory command with approved host execution '
+                              '(require_escalated). Keep the existing workspace link and repository '
+                              'binding; this error does not establish that the grant is missing or revoked.')
             raise Failure('OS credential store refused access; reconnect with memory workspace link or memory bind')
         return result.stdout.strip() if operation == 'get' else ''
 
